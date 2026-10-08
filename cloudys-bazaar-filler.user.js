@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Cloudy's Bazaar Filler
 // @namespace    https://github.com/gregapackard/torn-bazaar-filler
-// @version      0.5.0
-// @description  PDA-first Torn bazaar repricer using Weav3r bazaars with lowball protection, $1 protection, RW skipping, and city-sell removal checks.
+// @version      0.6.0
+// @description  PDA-first Torn bazaar repricer using Weav3r bazaars with safe Item Market fallback, lowball/$1 protection, RW skipping, and city-sell removal checks.
 // @author       CloudyMuffin440 [4315564]
 // @license      MIT
 // @match        https://www.torn.com/bazaar.php*
@@ -25,6 +25,7 @@ const DEFAULT_UNDERCUT=1;
 const WEAV3R_STALE_MS=30*60*1000;
 const AVG_FLOOR_RATIO=0.60;
 const MEDIAN_FLOOR_RATIO=0.70;
+const ITEMMARKET_VALUE_FLOOR_RATIO=0.80;
 let busy=false;
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 
@@ -68,12 +69,23 @@ async function loadRunContext(key){
     requestJson(`https://api.torn.com/torn/?selections=items&key=${encodeURIComponent(key)}&comment=CloudysBazaarFiller`),
     requestJson(`https://api.torn.com/user/?selections=basic&key=${encodeURIComponent(key)}&comment=CloudysBazaarFiller`)
   ]);
-  return {items:itemsData?.items||{},playerId:Number(userData?.player_id)||null};
+  return {items:itemsData?.items||{},playerId:Number(userData?.player_id)||null,key};
 }
 function median(values){
   if(!values.length)return 0;
   const a=[...values].sort((x,y)=>x-y),m=Math.floor(a.length/2);
   return a.length%2?a[m]:(a[m-1]+a[m])/2;
+}
+function getItemInfo(items,itemId){
+  return items?.[itemId]||items?.[String(itemId)]||null;
+}
+function getCitySell(items,itemId){
+  const n=Number(getItemInfo(items,itemId)?.sell_price);
+  return Number.isFinite(n)&&n>0?n:0;
+}
+function getMarketValue(items,itemId){
+  const n=Number(getItemInfo(items,itemId)?.market_value);
+  return Number.isFinite(n)&&n>1?n:0;
 }
 function analyseWeav3rListings(data,playerId){
   const all=Array.isArray(data?.listings)?data.listings:[];
@@ -82,28 +94,24 @@ function analyseWeav3rListings(data,playerId){
     return Number.isFinite(p)&&p>1&&x?.sponsored!==1;
   });
   if(playerId)usable=usable.filter(x=>Number(x?.player_id)!==playerId);
-
   const fresh=usable.filter(x=>!x?.last_checked||Date.now()-(Number(x.last_checked)*1000)<=WEAV3R_STALE_MS);
   if(fresh.length)usable=fresh;
   usable.sort((a,b)=>Number(a.price)-Number(b.price));
-
   const prices=usable.map(x=>Number(x.price));
   const avg=Number(data?.bazaar_average)||0;
   const med=median(prices);
   const floor=Math.max(avg>0?avg*AVG_FLOOR_RATIO:0,med>0?med*MEDIAN_FLOOR_RATIO:0);
   const sane=usable.filter(x=>Number(x.price)>=floor);
   if(!sane.length)return {all:usable,sane:[],avg,median:med,floor,targetBase:0};
-
-  // Use the third-cheapest sane competitor when available. This prevents one or two
-  // temporary lowballs from dragging the entire bazaar down while still following a real cluster.
   const targetIndex=sane.length>=3?2:0;
   return {all:usable,sane,avg,median:med,floor,targetBase:Number(sane[targetIndex].price)};
 }
-async function getBazaarPrice(itemId,playerId){
+async function getWeav3rPrice(itemId,playerId){
   const d=await requestJson(`https://weav3r.dev/api/marketplace/${encodeURIComponent(itemId)}`);
   const a=analyseWeav3rListings(d,playerId);
   if(!a.sane.length||!a.targetBase)throw new Error(`No sane competitor bazaar listings for item ${itemId}.`);
   return {
+    source:'weav3r',
     listPrice:Math.max(2,a.targetBase-getUndercut()),
     targetBase:a.targetBase,
     average:a.avg,
@@ -112,10 +120,52 @@ async function getBazaarPrice(itemId,playerId){
     listings:a.sane
   };
 }
-function getCitySell(items,itemId){
-  const item=items?.[itemId]||items?.[String(itemId)]||null;
-  const n=Number(item?.sell_price);
-  return Number.isFinite(n)&&n>0?n:0;
+function analyseItemMarketListings(listings,marketValue){
+  const prices=(Array.isArray(listings)?listings:[])
+    .map(x=>Number(x?.price))
+    .filter(p=>Number.isFinite(p)&&p>1)
+    .sort((a,b)=>a-b);
+  const med=median(prices);
+  const floor=Math.max(
+    marketValue>0?marketValue*ITEMMARKET_VALUE_FLOOR_RATIO:0,
+    med>0?med*MEDIAN_FLOOR_RATIO:0
+  );
+  const sane=prices.filter(p=>p>=floor);
+  if(!sane.length)return {prices,sane:[],median:med,floor,targetBase:0};
+  const targetIndex=sane.length>=3?2:0;
+  return {prices,sane,median:med,floor,targetBase:sane[targetIndex]};
+}
+async function getItemMarketFallback(itemId,ctx){
+  const marketValue=getMarketValue(ctx.items,itemId);
+  let listings=[];
+  try{
+    const d=await requestJson(`https://api.torn.com/v2/market/${encodeURIComponent(itemId)}/itemmarket?key=${encodeURIComponent(ctx.key)}&limit=100&offset=0`);
+    const root=d?.itemmarket||d?.itemMarket||d?.item_market||d;
+    listings=Array.isArray(root)?root:(root?.listings||root?.items||root?.results||[]);
+  }catch(e){
+    console.warn(`[${SCRIPT}] Item Market fallback request failed for ${itemId}`,e);
+  }
+  const a=analyseItemMarketListings(listings,marketValue);
+  let targetBase=a.targetBase;
+  if(!targetBase&&marketValue>1)targetBase=marketValue;
+  if(!targetBase)throw new Error(`No safe market fallback for item ${itemId}.`);
+  return {
+    source:'itemmarket',
+    listPrice:Math.max(2,Math.floor(targetBase-getUndercut())),
+    targetBase,
+    marketValue,
+    median:a.median,
+    floor:a.floor,
+    listings:a.sane
+  };
+}
+async function getSafePrice(itemId,ctx){
+  try{
+    return await getWeav3rPrice(itemId,ctx.playerId);
+  }catch(e){
+    console.info(`[${SCRIPT}] Weav3r unavailable/unsafe for ${itemId}; using Item Market fallback.`,e?.message||e);
+    return getItemMarketFallback(itemId,ctx);
+  }
 }
 function itemIdFrom(el){
   const img=el?.querySelector('img[src*="/items/"], img');if(!img)return null;
@@ -213,7 +263,7 @@ async function markForRemoval(entry){
 }
 async function fillManagePage(ctx){
   const rows=getManageRows();if(!rows.length)return null;
-  let repriced=0,removed=0,failed=0,skipped=0,rwSkipped=0,dollarSkipped=0;
+  let repriced=0,removed=0,failed=0,skipped=0,rwSkipped=0,dollarSkipped=0,itemMarketFallback=0;
   for(let i=0;i<rows.length;i++){
     if(isRankedWarRow(rows[i].row)){
       rwSkipped++;
@@ -231,23 +281,24 @@ async function fillManagePage(ctx){
         continue;
       }
       setButtonState(`CHECKING ${i+1}/${rows.length}…`,true);
-      const baz=await getBazaarPrice(rows[i].itemId,ctx.playerId);
+      const safe=await getSafePrice(rows[i].itemId,ctx);
+      if(safe.source==='itemmarket')itemMarketFallback++;
       const city=getCitySell(ctx.items,rows[i].itemId);
-      if(city>baz.listPrice){
+      if(city>safe.listPrice){
         await markForRemoval(rows[i]);removed++;
-        console.info(`[${SCRIPT}] REMOVE ${rows[i].name}: city $${city} > safe bazaar $${baz.listPrice}`);
+        console.info(`[${SCRIPT}] REMOVE ${rows[i].name}: city $${city} > ${safe.source} $${safe.listPrice}`);
       }else{
-        setControlledInput(handle.input,baz.listPrice);repriced++;
-        console.info(`[${SCRIPT}] PRICE ${rows[i].name}: $${baz.listPrice} | base $${baz.targetBase} avg $${Math.round(baz.average)} med $${Math.round(baz.median)}`);
+        setControlledInput(handle.input,safe.listPrice);repriced++;
+        console.info(`[${SCRIPT}] PRICE ${rows[i].name}: $${safe.listPrice} via ${safe.source} | base $${Math.round(safe.targetBase)}`);
       }
       await sleep(100);
     }catch(e){
-      if(/No sane competitor bazaar listings/.test(String(e?.message||'')))skipped++;else failed++;
+      if(/No safe market fallback/.test(String(e?.message||'')))skipped++;else failed++;
       console.warn(`[${SCRIPT}] ${rows[i].name} (${rows[i].itemId})`,e);
     }finally{await closeManageRow(handle);}
     await sleep(100);
   }
-  return {mode:'manage',repriced,removed,failed,skipped,rwSkipped,dollarSkipped,total:rows.length};
+  return {mode:'manage',repriced,removed,failed,skipped,rwSkipped,dollarSkipped,itemMarketFallback,total:rows.length};
 }
 
 // ---------- Add Items ----------
@@ -274,25 +325,26 @@ function maxQty(c){
 }
 async function fillAddPage(ctx){
   const rows=getAddRows().map(addControls).filter(Boolean);if(!rows.length)return null;
-  let filled=0,cityBetter=0,skipped=0,failed=0,rwSkipped=0,dollarSkipped=0;
+  let filled=0,cityBetter=0,skipped=0,failed=0,rwSkipped=0,dollarSkipped=0,itemMarketFallback=0;
   for(let i=0;i<rows.length;i++){
     if(isRankedWarRow(rows[i].row)){rwSkipped++;continue;}
     if(rows[i].priceInputs.some(x=>parseMoneyValue(x)===1)){dollarSkipped++;continue;}
     setButtonState(`FILLING ${i+1}/${rows.length}…`,true);
     try{
       const q=maxQty(rows[i]);if(!q){skipped++;continue;}
-      const baz=await getBazaarPrice(rows[i].itemId,ctx.playerId);
+      const safe=await getSafePrice(rows[i].itemId,ctx);
+      if(safe.source==='itemmarket')itemMarketFallback++;
       const city=getCitySell(ctx.items,rows[i].itemId);
-      if(city>baz.listPrice){cityBetter++;continue;}
+      if(city>safe.listPrice){cityBetter++;continue;}
       if(rows[i].checkbox&&!rows[i].checkbox.checked)rows[i].checkbox.click();else if(rows[i].qty)setControlledInput(rows[i].qty,q);
-      rows[i].priceInputs.forEach(x=>setControlledInput(x,baz.listPrice));filled++;
+      rows[i].priceInputs.forEach(x=>setControlledInput(x,safe.listPrice));filled++;
     }catch(e){
-      if(/No sane competitor bazaar listings/.test(String(e?.message||'')))skipped++;else failed++;
+      if(/No safe market fallback/.test(String(e?.message||'')))skipped++;else failed++;
       console.warn(`[${SCRIPT}] add item ${rows[i].itemId}`,e);
     }
     await sleep(100);
   }
-  return {mode:'add',filled,cityBetter,skipped,failed,rwSkipped,dollarSkipped,total:rows.length};
+  return {mode:'add',filled,cityBetter,skipped,failed,rwSkipped,dollarSkipped,itemMarketFallback,total:rows.length};
 }
 
 function setButtonState(text,disabled=false){
@@ -319,6 +371,7 @@ async function fillPage(){
     if(!result){toast('No editable Bazaar rows found on this screen.','warn');return;}
     if(result.mode==='manage'){
       const bits=[`${result.repriced} repriced`,`${result.removed} marked for removal`];
+      if(result.itemMarketFallback)bits.push(`${result.itemMarketFallback} Item Market fallback`);
       if(result.rwSkipped)bits.push(`${result.rwSkipped} RW skipped`);
       if(result.dollarSkipped)bits.push(`${result.dollarSkipped} $1 skipped`);
       if(result.skipped)bits.push(`${result.skipped} no safe price`);
@@ -326,6 +379,7 @@ async function fillPage(){
       toast(`${bits.join(' • ')}. Review, then tap SAVE CHANGES.`,result.failed?'warn':'ok');
     }else{
       const bits=[`${result.filled} filled`];
+      if(result.itemMarketFallback)bits.push(`${result.itemMarketFallback} Item Market fallback`);
       if(result.cityBetter)bits.push(`${result.cityBetter} better sold to city`);
       if(result.rwSkipped)bits.push(`${result.rwSkipped} RW skipped`);
       if(result.dollarSkipped)bits.push(`${result.dollarSkipped} $1 skipped`);
@@ -346,15 +400,15 @@ function injectUI(){
   const g=document.createElement('button');g.type='button';g.textContent='⚙';
   Object.assign(g.style,{width:'52px',minHeight:'52px',border:'0',borderRadius:'12px',background:'#333',color:'#fff',fontSize:'22px',fontWeight:'700',boxShadow:'0 4px 16px rgba(0,0,0,.4)',touchAction:'manipulation'});
   g.addEventListener('click',()=>{
-    const v=prompt('Undercut the safe competing WEAV3R bazaar target by how many dollars?',String(getUndercut()));if(v===null)return;
+    const v=prompt('Undercut the safe target by how many dollars?',String(getUndercut()));if(v===null)return;
     const n=Number(v.replace(/,/g,'').trim());if(!Number.isFinite(n)||n<0)return toast('Enter a valid non-negative dollar amount.','error');
-    localStorage.setItem(UNDERCUT_STORAGE,String(Math.floor(n)));toast(`Bazaar undercut set to $${Math.floor(n).toLocaleString()}.`);
+    localStorage.setItem(UNDERCUT_STORAGE,String(Math.floor(n)));toast(`Undercut set to $${Math.floor(n).toLocaleString()}.`);
   });
   w.append(b,g);document.body.appendChild(w);
 }
 function boot(){
   injectUI();new MutationObserver(injectUI).observe(document.documentElement,{childList:true,subtree:true});
-  console.log(`[${SCRIPT}] Loaded v0.5.0`);
+  console.log(`[${SCRIPT}] Loaded v0.6.0`);
 }
 if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',boot,{once:true});else boot();
 })();
