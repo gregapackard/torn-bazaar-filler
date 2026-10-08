@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Cloudy's Bazaar Filler
 // @namespace    https://github.com/gregapackard/torn-bazaar-filler
-// @version      0.3.0
+// @version      0.3.1
 // @description  PDA-first Torn bazaar filler/repricer. One button fills Add Items or opens and reprices each visible Manage Items row on mobile.
 // @author       CloudyMuffin440 [4315564]
 // @license      MIT
@@ -50,10 +50,13 @@ function getApiKey(){
 function getUndercut(){const n=Number(localStorage.getItem(UNDERCUT_STORAGE));return Number.isFinite(n)&&n>=0?Math.floor(n):DEFAULT_UNDERCUT;}
 function apiGet(url){return new Promise((resolve,reject)=>GM_xmlhttpRequest({method:'GET',url,timeout:12000,onload:r=>{try{const d=JSON.parse(r.responseText);d?.error?reject(new Error(d.error.error||`Torn API error ${d.error.code}`)):resolve(d);}catch(e){reject(e)}},onerror:()=>reject(new Error('Network error contacting Torn API.')),ontimeout:()=>reject(new Error('Torn API request timed out.'))}));}
 async function getLowestMarketPrice(itemId,key){
-  const d=await apiGet(`https://api.torn.com/v2/market?id=${encodeURIComponent(itemId)}&selections=itemMarket&key=${encodeURIComponent(key)}&comment=CloudysBazaarFiller`);
-  const listings=d?.itemmarket||d?.itemMarket||d?.item_market||[];
-  const prices=Array.isArray(listings)?listings.map(x=>Number(x?.price)).filter(x=>Number.isFinite(x)&&x>0).sort((a,b)=>a-b):[];
-  if(!prices.length)throw new Error('No Item Market listings found.');
+  const d=await apiGet(`https://api.torn.com/v2/market/${encodeURIComponent(itemId)}/itemmarket?key=${encodeURIComponent(key)}&offset=0`);
+  const root=d?.itemmarket||d?.itemMarket||d?.item_market||d;
+  const listings=Array.isArray(root)?root:(root?.listings||root?.items||root?.results||[]);
+  const prices=Array.isArray(listings)
+    ? listings.map(x=>Number(x?.price)).filter(x=>Number.isFinite(x)&&x>0).sort((a,b)=>a-b)
+    : [];
+  if(!prices.length)throw new Error(`No Item Market listings found for item ${itemId}.`);
   return prices[0];
 }
 function itemIdFrom(el){
@@ -213,6 +216,6 @@ function injectUI(){
   const g=document.createElement('button');g.type='button';g.textContent='⚙';Object.assign(g.style,{width:'52px',minHeight:'52px',border:'0',borderRadius:'12px',background:'#333',color:'#fff',fontSize:'22px',fontWeight:'700',boxShadow:'0 4px 16px rgba(0,0,0,.4)',touchAction:'manipulation'});g.addEventListener('click',()=>{const v=prompt('Undercut the cheapest Item Market listing by how many dollars?',String(getUndercut()));if(v===null)return;const n=Number(v.replace(/,/g,'').trim());if(!Number.isFinite(n)||n<0)return toast('Enter a valid non-negative dollar amount.','error');localStorage.setItem(UNDERCUT_STORAGE,String(Math.floor(n)));toast(`Undercut set to $${Math.floor(n).toLocaleString()}.`);});
   w.append(b,g);document.body.appendChild(w);
 }
-function boot(){injectUI();new MutationObserver(injectUI).observe(document.documentElement,{childList:true,subtree:true});console.log(`[${SCRIPT}] Loaded v0.3.0`);}
+function boot(){injectUI();new MutationObserver(injectUI).observe(document.documentElement,{childList:true,subtree:true});console.log(`[${SCRIPT}] Loaded v0.3.1`);}
 if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',boot,{once:true});else boot();
 })();
