@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Cloudy's Bazaar Filler
 // @namespace    https://github.com/gregapackard/torn-bazaar-filler
-// @version      0.9.2
-// @description  PDA-first Torn bazaar repricer using Weav3r marketplace data, safe fallback pricing, RW/$1 protection, city checks, and Nikeh removal.
+// @version      0.9.3
+// @description  PDA-first Torn bazaar repricer using Weav3r bazaar data with throttled retries, safe fallback pricing, RW/$1 protection, city checks, and Nikeh removal.
 // @author       CloudyMuffin440 [4315564]
 // @license      MIT
 // @match        https://www.torn.com/bazaar.php*
@@ -23,7 +23,10 @@ const API_KEY_STORAGE='cloudys-bazaar-filler-api-key';
 const UNDERCUT_STORAGE='cloudys-bazaar-filler-undercut';
 const DEFAULT_UNDERCUT=1;
 const NIKEH_ITEMS=new Set([1484,1494,1485,1498,1493,1268]);
+const WEAVER_MIN_GAP_MS=350;
+const WEAVER_RETRY_DELAYS=[0,750,1500,3000];
 let busy=false;
+let lastWeaverRequestAt=0;
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 
 function fireInput(input){
@@ -54,19 +57,22 @@ function getUndercut(){
   const n=Number(localStorage.getItem(UNDERCUT_STORAGE));
   return Number.isFinite(n)&&n>=0?Math.floor(n):DEFAULT_UNDERCUT;
 }
-function requestJson(url){
+function apiError(message,status=0,code='REQUEST_FAILED'){
+  const e=new Error(message);e.status=status;e.code=code;return e;
+}
+function requestJson(url,timeout=15000){
   return new Promise((resolve,reject)=>GM_xmlhttpRequest({
-    method:'GET',url,timeout:15000,
+    method:'GET',url,timeout,
     onload:r=>{
       try{
-        if(r.status<200||r.status>=300)throw new Error(`HTTP ${r.status}`);
+        if(r.status<200||r.status>=300)throw apiError(`HTTP ${r.status}`,r.status);
         const d=JSON.parse(r.responseText);
-        if(d?.error)reject(new Error(d.error.error||`API error ${d.error.code}`));
+        if(d?.error)reject(apiError(d.error.error||`API error ${d.error.code}`,r.status,'API_ERROR'));
         else resolve(d);
       }catch(e){reject(e);}
     },
-    onerror:()=>reject(new Error('Network error.')),
-    ontimeout:()=>reject(new Error('Request timed out.'))
+    onerror:()=>reject(apiError('Network error.',0,'NETWORK')),
+    ontimeout:()=>reject(apiError('Request timed out.',0,'TIMEOUT'))
   }));
 }
 async function loadRunContext(key){
@@ -86,26 +92,56 @@ function getTornMarketValue(items,id){
   return Number.isFinite(n)&&n>1?n:0;
 }
 
-// Pick the actual cheapest listing unless it is clearly a lone lowball/transfer.
-function pickLowestRealPrice(prices,anchor=0){
+function shouldRetryWeaver(e){
+  return e?.status===429||e?.status===408||e?.status>=500||e?.code==='NETWORK'||e?.code==='TIMEOUT';
+}
+async function throttleWeaver(){
+  const wait=Math.max(0,WEAVER_MIN_GAP_MS-(Date.now()-lastWeaverRequestAt));
+  if(wait)await sleep(wait);
+  lastWeaverRequestAt=Date.now();
+}
+async function requestWeaverJson(url){
+  let lastErr=null;
+  for(let i=0;i<WEAVER_RETRY_DELAYS.length;i++){
+    if(WEAVER_RETRY_DELAYS[i])await sleep(WEAVER_RETRY_DELAYS[i]);
+    await throttleWeaver();
+    try{return await requestJson(url,15000);}
+    catch(e){
+      lastErr=e;
+      if(!shouldRetryWeaver(e))throw e;
+      console.warn(`[${SCRIPT}] Weaver retry ${i+1}/${WEAVER_RETRY_DELAYS.length}:`,e.message);
+    }
+  }
+  const e=apiError(lastErr?.message||'Weaver temporarily unavailable',lastErr?.status||0,'WEAVER_UNAVAILABLE');
+  throw e;
+}
+
+// Use the real lowest competitor unless it looks like an extreme transfer/joke listing.
+function pickLowestRealPrice(prices,marketPrice=0,bazaarAverage=0){
   const p=prices.filter(x=>Number.isFinite(x)&&x>1).sort((a,b)=>a-b);
   if(!p.length)return null;
   let index=0;
   if(p.length>=3){
     const [p0,p1,p2]=p;
-    const nextTwoCluster=p1<=p2*1.10;
-    const isolatedVsNext=p0<p1*0.75;
-    const isolatedVsMarket=anchor>0 && p0<anchor*0.50 && p1>=anchor*0.75;
-    if(nextTwoCluster&&(isolatedVsNext||isolatedVsMarket))index=1;
-  }else if(p.length===2 && anchor>0){
-    if(p[0]<anchor*0.45 && p[1]>=anchor*0.75)index=1;
+    const anchors=[marketPrice,bazaarAverage].filter(x=>Number.isFinite(x)&&x>1);
+    const anchor=anchors.length?anchors.reduce((a,b)=>a+b,0)/anchors.length:0;
+    const nextTwoCluster=p1<=p2*1.08;
+    const extremeGap=p0<p1*0.55;
+    const extremeVsAnchor=anchor>0&&p0<anchor*0.55&&p1>=anchor*0.70;
+    if(nextTwoCluster&&extremeGap&&extremeVsAnchor)index=1;
   }
   return {base:p[index],index,prices:p};
 }
 
 async function getWeaverPrice(itemId,ctx){
-  // Match Weav3r's own script: request up to 100 marketplace listings.
-  const d=await requestJson(`https://weav3r.dev/api/marketplace/${encodeURIComponent(itemId)}?limit=100`);
+  let d;
+  try{
+    d=await requestWeaverJson(`https://weav3r.dev/api/marketplace/${encodeURIComponent(itemId)}?limit=100`);
+  }catch(e){
+    if(e?.code==='WEAVER_UNAVAILABLE')throw e;
+    const out=apiError(e?.message||'Weaver request failed',e?.status||0,'WEAVER_UNAVAILABLE');
+    throw out;
+  }
   const marketPrice=Number(d?.market_price)||0;
   const bazaarAverage=Number(d?.bazaar_average)||0;
   let listings=Array.isArray(d?.listings)?d.listings:[];
@@ -115,21 +151,16 @@ async function getWeaverPrice(itemId,ctx){
   });
   if(ctx.playerId)listings=listings.filter(x=>Number(x?.player_id)!==ctx.playerId);
 
-  // Deliberately do NOT discard listings by age. Weav3r's official script displays/sorts
-  // the returned marketplace set and exposes age separately; filtering to only very-fresh
-  // rows distorted our price sample on sparse items.
-  const picked=pickLowestRealPrice(listings.map(x=>Number(x.price)),marketPrice);
-  if(!picked)throw new Error('No usable Weaver bazaar listings');
-
+  const picked=pickLowestRealPrice(listings.map(x=>Number(x.price)),marketPrice,bazaarAverage);
+  if(!picked){
+    const e=apiError('Weaver returned no usable bazaar listings',200,'NO_WEAVER_DATA');
+    throw e;
+  }
   const listPrice=Math.max(2,Math.floor(picked.base-getUndercut()));
   return {
-    source:'weaver',
-    targetBase:picked.base,
-    listPrice,
-    marketPrice,
-    bazaarAverage,
+    source:'weaver',targetBase:picked.base,listPrice,marketPrice,bazaarAverage,
     skippedLowball:picked.index>0,
-    bazaarPremium:marketPrice>1 && listPrice>marketPrice
+    bazaarPremium:marketPrice>1&&listPrice>marketPrice
   };
 }
 
@@ -144,15 +175,13 @@ async function getFallbackPrice(itemId,ctx){
   try{
     const d=await requestJson(`https://api.torn.com/v2/market/${encodeURIComponent(itemId)}/itemmarket?key=${encodeURIComponent(ctx.key)}&limit=100&offset=0`);
     prices=parseItemMarketListings(d);
-  }catch(e){
-    console.warn(`[${SCRIPT}] Item Market fallback request failed for ${itemId}`,e);
-  }
+  }catch(e){console.warn(`[${SCRIPT}] Item Market fallback failed for ${itemId}`,e);}
 
-  const picked=pickLowestRealPrice(prices,marketValue);
+  const picked=pickLowestRealPrice(prices,marketValue,marketValue);
   let base=picked?.base||0;
   let source='itemmarket';
   if(!base&&marketValue>1){base=marketValue;source='marketvalue';}
-  if(!base)throw new Error('No safe fallback price');
+  if(!base)throw apiError('No safe fallback price',0,'NO_FALLBACK');
 
   let listPrice=Math.max(2,Math.floor(base-getUndercut()));
   let fallbackCapped=false;
@@ -165,8 +194,12 @@ async function getFallbackPrice(itemId,ctx){
 async function getSafePrice(itemId,ctx){
   try{return await getWeaverPrice(itemId,ctx);}
   catch(e){
-    console.info(`[${SCRIPT}] Weaver unavailable for ${itemId}; using fallback.`,e?.message||e);
-    return getFallbackPrice(itemId,ctx);
+    // Only fall back when Weaver answered successfully but genuinely has no usable bazaar data.
+    if(e?.code==='NO_WEAVER_DATA'){
+      console.info(`[${SCRIPT}] No Weaver bazaar data for ${itemId}; using safe fallback.`);
+      return getFallbackPrice(itemId,ctx);
+    }
+    throw e;
   }
 }
 
@@ -255,14 +288,12 @@ async function closeManageRow(handle){if(handle?.openedByUs&&handle.button){hand
 async function markForRemoval(entry){
   const input=await waitFor(()=>findRemoveInput(entry.row),1000,40);
   if(!input)throw new Error('Remove quantity input not found');
-  const qty=parseListedQty(entry.row,input);
-  setControlledInput(input,qty);
-  return qty;
+  const qty=parseListedQty(entry.row,input);setControlledInput(input,qty);return qty;
 }
 
 async function fillManagePage(ctx){
   const rows=getManageRows();if(!rows.length)return null;
-  let repriced=0,removed=0,nikehRemoved=0,skipped=0,rwSkipped=0,dollarSkipped=0;
+  let repriced=0,removed=0,nikehRemoved=0,skipped=0,weaverUnavailable=0,rwSkipped=0,dollarSkipped=0;
   let fallback=0,fallbackCapped=0,bazaarPremium=0,lowballsSkipped=0;
   for(let i=0;i<rows.length;i++){
     if(isRankedWarRow(rows[i].row)){rwSkipped++;continue;}
@@ -271,10 +302,8 @@ async function fillManagePage(ctx){
     try{
       handle=await openManageRow(rows[i]);
       if(parseMoneyValue(handle.input)===1){dollarSkipped++;continue;}
-      if(NIKEH_ITEMS.has(rows[i].itemId)){
-        await markForRemoval(rows[i]);nikehRemoved++;removed++;continue;
-      }
-      setButtonState(`CHECKING ${i+1}/${rows.length}…`,true);
+      if(NIKEH_ITEMS.has(rows[i].itemId)){await markForRemoval(rows[i]);nikehRemoved++;removed++;continue;}
+      setButtonState(`PRICING ${i+1}/${rows.length}…`,true);
       const safe=await getSafePrice(rows[i].itemId,ctx);
       if(safe.source!=='weaver')fallback++;
       if(safe.fallbackCapped)fallbackCapped++;
@@ -284,11 +313,13 @@ async function fillManagePage(ctx){
       if(city>safe.listPrice){await markForRemoval(rows[i]);removed++;}
       else{setControlledInput(handle.input,safe.listPrice);repriced++;}
       console.info(`[${SCRIPT}] ${rows[i].name}: ${safe.source} $${safe.listPrice} base $${safe.targetBase}${safe.marketPrice?` Weaver market $${safe.marketPrice}`:''}`);
-    }catch(e){skipped++;console.warn(`[${SCRIPT}] ${rows[i].name} (${rows[i].itemId})`,e);}
-    finally{await closeManageRow(handle);}
+    }catch(e){
+      if(e?.code==='WEAVER_UNAVAILABLE')weaverUnavailable++;else skipped++;
+      console.warn(`[${SCRIPT}] ${rows[i].name} (${rows[i].itemId})`,e);
+    }finally{await closeManageRow(handle);}
     await sleep(100);
   }
-  return {mode:'manage',repriced,removed,nikehRemoved,skipped,rwSkipped,dollarSkipped,fallback,fallbackCapped,bazaarPremium,lowballsSkipped,total:rows.length};
+  return {mode:'manage',repriced,removed,nikehRemoved,skipped,weaverUnavailable,rwSkipped,dollarSkipped,fallback,fallbackCapped,bazaarPremium,lowballsSkipped,total:rows.length};
 }
 
 function getAddRows(){
@@ -314,7 +345,7 @@ function maxQty(c){
 }
 async function fillAddPage(ctx){
   const rows=getAddRows().map(addControls).filter(Boolean);if(!rows.length)return null;
-  let filled=0,cityBetter=0,nikehSkipped=0,skipped=0,rwSkipped=0,dollarSkipped=0;
+  let filled=0,cityBetter=0,nikehSkipped=0,skipped=0,weaverUnavailable=0,rwSkipped=0,dollarSkipped=0;
   let fallback=0,fallbackCapped=0,bazaarPremium=0,lowballsSkipped=0;
   for(let i=0;i<rows.length;i++){
     if(isRankedWarRow(rows[i].row)){rwSkipped++;continue;}
@@ -332,12 +363,14 @@ async function fillAddPage(ctx){
       if(city>safe.listPrice){cityBetter++;continue;}
       if(rows[i].checkbox&&!rows[i].checkbox.checked)rows[i].checkbox.click();
       else if(rows[i].qty)setControlledInput(rows[i].qty,q);
-      rows[i].priceInputs.forEach(x=>setControlledInput(x,safe.listPrice));
-      filled++;
-    }catch(e){skipped++;console.warn(`[${SCRIPT}] add ${rows[i].itemId}`,e);}
+      rows[i].priceInputs.forEach(x=>setControlledInput(x,safe.listPrice));filled++;
+    }catch(e){
+      if(e?.code==='WEAVER_UNAVAILABLE')weaverUnavailable++;else skipped++;
+      console.warn(`[${SCRIPT}] add ${rows[i].itemId}`,e);
+    }
     await sleep(100);
   }
-  return {mode:'add',filled,cityBetter,nikehSkipped,skipped,rwSkipped,dollarSkipped,fallback,fallbackCapped,bazaarPremium,lowballsSkipped,total:rows.length};
+  return {mode:'add',filled,cityBetter,nikehSkipped,skipped,weaverUnavailable,rwSkipped,dollarSkipped,fallback,fallbackCapped,bazaarPremium,lowballsSkipped,total:rows.length};
 }
 
 function setButtonState(text,disabled=false){
@@ -352,7 +385,7 @@ function toast(msg,type='ok'){
     document.body.appendChild(b);
   }
   b.style.background=type==='error'?'#a82c2c':type==='warn'?'#8a6515':'#287842';
-  b.textContent=msg;b.style.opacity='1';clearTimeout(b._t);b._t=setTimeout(()=>b.style.opacity='0',9000);
+  b.textContent=msg;b.style.opacity='1';clearTimeout(b._t);b._t=setTimeout(()=>b.style.opacity='0',10000);
 }
 async function fillPage(){
   if(busy)return;busy=true;setButtonState('LOADING PRICES…',true);
@@ -360,30 +393,22 @@ async function fillPage(){
     const ctx=await loadRunContext(getApiKey());
     let result=await fillManagePage(ctx);if(!result)result=await fillAddPage(ctx);
     if(!result){toast('No editable Bazaar rows found on this screen.','warn');return;}
-    if(result.mode==='manage'){
-      const bits=[`${result.repriced} repriced`,`${result.removed} removal`];
-      if(result.nikehRemoved)bits.push(`${result.nikehRemoved} Nikeh`);
-      if(result.bazaarPremium)bits.push(`${result.bazaarPremium} bazaar premium`);
-      if(result.fallback)bits.push(`${result.fallback} fallback`);
-      if(result.fallbackCapped)bits.push(`${result.fallbackCapped} fallback capped`);
-      if(result.lowballsSkipped)bits.push(`${result.lowballsSkipped} lowball ignored`);
-      if(result.rwSkipped)bits.push(`${result.rwSkipped} RW skipped`);
-      if(result.dollarSkipped)bits.push(`${result.dollarSkipped} $1 skipped`);
-      if(result.skipped)bits.push(`${result.skipped} untouched`);
-      toast(`${bits.join(' • ')}. Review, then tap SAVE CHANGES.`,result.skipped?'warn':'ok');
-    }else{
-      const bits=[`${result.filled} filled`];
-      if(result.nikehSkipped)bits.push(`${result.nikehSkipped} Nikeh skipped`);
-      if(result.cityBetter)bits.push(`${result.cityBetter} city better`);
-      if(result.bazaarPremium)bits.push(`${result.bazaarPremium} bazaar premium`);
-      if(result.fallback)bits.push(`${result.fallback} fallback`);
-      if(result.fallbackCapped)bits.push(`${result.fallbackCapped} fallback capped`);
-      if(result.lowballsSkipped)bits.push(`${result.lowballsSkipped} lowball ignored`);
-      if(result.rwSkipped)bits.push(`${result.rwSkipped} RW skipped`);
-      if(result.dollarSkipped)bits.push(`${result.dollarSkipped} $1 skipped`);
-      if(result.skipped)bits.push(`${result.skipped} untouched`);
-      toast(bits.join(' • '),result.skipped?'warn':'ok');
-    }
+    const bits=[];
+    if(result.mode==='manage')bits.push(`${result.repriced} repriced`,`${result.removed} removal`);
+    else bits.push(`${result.filled} filled`);
+    if(result.nikehRemoved)bits.push(`${result.nikehRemoved} Nikeh`);
+    if(result.nikehSkipped)bits.push(`${result.nikehSkipped} Nikeh skipped`);
+    if(result.cityBetter)bits.push(`${result.cityBetter} city better`);
+    if(result.bazaarPremium)bits.push(`${result.bazaarPremium} bazaar premium`);
+    if(result.fallback)bits.push(`${result.fallback} genuine fallback`);
+    if(result.fallbackCapped)bits.push(`${result.fallbackCapped} fallback capped`);
+    if(result.lowballsSkipped)bits.push(`${result.lowballsSkipped} extreme lowball ignored`);
+    if(result.weaverUnavailable)bits.push(`${result.weaverUnavailable} Weaver unavailable — untouched`);
+    if(result.rwSkipped)bits.push(`${result.rwSkipped} RW skipped`);
+    if(result.dollarSkipped)bits.push(`${result.dollarSkipped} $1 skipped`);
+    if(result.skipped)bits.push(`${result.skipped} untouched`);
+    const suffix=result.mode==='manage'?'. Review, then tap SAVE CHANGES.':'';
+    toast(bits.join(' • ')+suffix,(result.weaverUnavailable||result.skipped)?'warn':'ok');
   }catch(e){console.error(`[${SCRIPT}]`,e);toast(e.message||'Fill failed.','error');}
   finally{busy=false;setButtonState('FILL THIS PAGE');}
 }
@@ -405,7 +430,7 @@ function injectUI(){
 }
 function boot(){
   injectUI();new MutationObserver(injectUI).observe(document.documentElement,{childList:true,subtree:true});
-  console.log(`[${SCRIPT}] Loaded v0.9.2`);
+  console.log(`[${SCRIPT}] Loaded v0.9.3`);
 }
 if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',boot,{once:true});else boot();
 })();
