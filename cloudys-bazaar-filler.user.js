@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Cloudy's Bazaar Filler
 // @namespace    https://github.com/gregapackard/torn-bazaar-filler
-// @version      0.4.0
-// @description  PDA-first Torn bazaar repricer. Uses live Weav3r bazaar listings, excludes your own listing when possible, and marks items for removal when Torn's city sell price beats the bazaar price.
+// @version      0.5.0
+// @description  PDA-first Torn bazaar repricer using Weav3r bazaars with lowball protection, $1 protection, RW skipping, and city-sell removal checks.
 // @author       CloudyMuffin440 [4315564]
 // @license      MIT
 // @match        https://www.torn.com/bazaar.php*
@@ -23,7 +23,8 @@ const API_KEY_STORAGE='cloudys-bazaar-filler-api-key';
 const UNDERCUT_STORAGE='cloudys-bazaar-filler-undercut';
 const DEFAULT_UNDERCUT=1;
 const WEAV3R_STALE_MS=30*60*1000;
-const BAZAAR_SANITY_FLOOR_RATIO=0.25;
+const AVG_FLOOR_RATIO=0.60;
+const MEDIAN_FLOOR_RATIO=0.70;
 let busy=false;
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 
@@ -35,7 +36,7 @@ function fireInput(input){
 function setControlledInput(input,value){
   if(!input)return;
   const d=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value');
-  if(d?.set)d.set.call(input,String(value)); else input.value=String(value);
+  if(d?.set)d.set.call(input,String(value));else input.value=String(value);
   fireInput(input);
 }
 function visible(el){
@@ -50,7 +51,10 @@ function getApiKey(){
   if(!/^[A-Za-z0-9]{16}$/.test(key))throw new Error('A valid 16-character Torn API key is required.');
   localStorage.setItem(API_KEY_STORAGE,key);return key;
 }
-function getUndercut(){const n=Number(localStorage.getItem(UNDERCUT_STORAGE));return Number.isFinite(n)&&n>=0?Math.floor(n):DEFAULT_UNDERCUT;}
+function getUndercut(){
+  const n=Number(localStorage.getItem(UNDERCUT_STORAGE));
+  return Number.isFinite(n)&&n>=0?Math.floor(n):DEFAULT_UNDERCUT;
+}
 function requestJson(url){
   return new Promise((resolve,reject)=>GM_xmlhttpRequest({
     method:'GET',url,timeout:15000,
@@ -64,24 +68,49 @@ async function loadRunContext(key){
     requestJson(`https://api.torn.com/torn/?selections=items&key=${encodeURIComponent(key)}&comment=CloudysBazaarFiller`),
     requestJson(`https://api.torn.com/user/?selections=basic&key=${encodeURIComponent(key)}&comment=CloudysBazaarFiller`)
   ]);
-  return {items:itemsData?.items||{}, playerId:Number(userData?.player_id)||null};
+  return {items:itemsData?.items||{},playerId:Number(userData?.player_id)||null};
 }
-function normaliseWeav3rListings(data,playerId){
+function median(values){
+  if(!values.length)return 0;
+  const a=[...values].sort((x,y)=>x-y),m=Math.floor(a.length/2);
+  return a.length%2?a[m]:(a[m-1]+a[m])/2;
+}
+function analyseWeav3rListings(data,playerId){
   const all=Array.isArray(data?.listings)?data.listings:[];
-  const avg=Number(data?.bazaar_average)||0;
-  const floor=avg>0?avg*BAZAAR_SANITY_FLOOR_RATIO:0;
-  let usable=all.filter(x=>Number(x?.price)>0 && x?.sponsored!==1 && Number(x.price)>=floor);
+  let usable=all.filter(x=>{
+    const p=Number(x?.price);
+    return Number.isFinite(p)&&p>1&&x?.sponsored!==1;
+  });
   if(playerId)usable=usable.filter(x=>Number(x?.player_id)!==playerId);
-  const fresh=usable.filter(x=>!x?.last_checked || Date.now()-(Number(x.last_checked)*1000)<=WEAV3R_STALE_MS);
-  usable=fresh.length?fresh:usable;
-  return usable.sort((a,b)=>Number(a.price)-Number(b.price));
+
+  const fresh=usable.filter(x=>!x?.last_checked||Date.now()-(Number(x.last_checked)*1000)<=WEAV3R_STALE_MS);
+  if(fresh.length)usable=fresh;
+  usable.sort((a,b)=>Number(a.price)-Number(b.price));
+
+  const prices=usable.map(x=>Number(x.price));
+  const avg=Number(data?.bazaar_average)||0;
+  const med=median(prices);
+  const floor=Math.max(avg>0?avg*AVG_FLOOR_RATIO:0,med>0?med*MEDIAN_FLOOR_RATIO:0);
+  const sane=usable.filter(x=>Number(x.price)>=floor);
+  if(!sane.length)return {all:usable,sane:[],avg,median:med,floor,targetBase:0};
+
+  // Use the third-cheapest sane competitor when available. This prevents one or two
+  // temporary lowballs from dragging the entire bazaar down while still following a real cluster.
+  const targetIndex=sane.length>=3?2:0;
+  return {all:usable,sane,avg,median:med,floor,targetBase:Number(sane[targetIndex].price)};
 }
 async function getBazaarPrice(itemId,playerId){
   const d=await requestJson(`https://weav3r.dev/api/marketplace/${encodeURIComponent(itemId)}`);
-  const listings=normaliseWeav3rListings(d,playerId);
-  if(!listings.length)throw new Error(`No usable competitor bazaar listings for item ${itemId}.`);
-  const lowest=Number(listings[0].price);
-  return {lowest,listPrice:Math.max(1,lowest-getUndercut()),listings};
+  const a=analyseWeav3rListings(d,playerId);
+  if(!a.sane.length||!a.targetBase)throw new Error(`No sane competitor bazaar listings for item ${itemId}.`);
+  return {
+    listPrice:Math.max(2,a.targetBase-getUndercut()),
+    targetBase:a.targetBase,
+    average:a.avg,
+    median:a.median,
+    floor:a.floor,
+    listings:a.sane
+  };
 }
 function getCitySell(items,itemId){
   const item=items?.[itemId]||items?.[String(itemId)]||null;
@@ -89,7 +118,7 @@ function getCitySell(items,itemId){
   return Number.isFinite(n)&&n>0?n:0;
 }
 function itemIdFrom(el){
-  const img=el?.querySelector('img[src*="/items/"], img'); if(!img)return null;
+  const img=el?.querySelector('img[src*="/items/"], img');if(!img)return null;
   const src=img.src||img.getAttribute('src')||'';
   const m=src.match(/\/items\/(\d+)\//i)||src.match(/\/items\/(\d+)\./i)||src.match(/\/(\d+)\.(?:png|jpg|webp)/i)||src.match(/\/(\d+)\//);
   return m?Number(m[1]):null;
@@ -97,6 +126,18 @@ function itemIdFrom(el){
 function itemName(el){
   const txt=(el?.innerText||'').split('\n').map(x=>x.trim()).filter(Boolean);
   return txt.find(x=>!/^x?\d+$/.test(x)&&!/^\$/.test(x))||'item';
+}
+function isRankedWarRow(row){
+  if(!row)return false;
+  const bonus=row.querySelector('[class*="bonus-attachment-"], ul.bonuses-wrap li.bonus [class*="bonus-attachment-"]');
+  const glow=row.querySelector('.glow-yellow,.glow-orange,.glow-red,[class*="glow-yellow"],[class*="glow-orange"],[class*="glow-red"]');
+  const bonusWrap=row.querySelector('ul.bonuses-wrap li.bonus,[class*="bonuses-wrap"] [class*="bonus"]');
+  return !!bonus||!!(glow&&bonusWrap);
+}
+function parseMoneyValue(input){
+  const raw=String(input?.value??'').replace(/[$,\s]/g,'');
+  const n=Number(raw);
+  return Number.isFinite(n)?n:0;
 }
 async function waitFor(fn,timeout=2200,interval=40){
   const end=Date.now()+timeout;
@@ -120,8 +161,8 @@ function getManageRows(){
 }
 function getManageButton(row){
   return row.querySelector('[class*="menuActivators___"] button[class*="iconContainer___"][aria-label="Manage"]')
-      || row.querySelector('button[aria-label="Manage"]')
-      || [...row.querySelectorAll('button')].find(b=>/manage/i.test(b.getAttribute('aria-label')||b.title||''));
+      ||row.querySelector('button[aria-label="Manage"]')
+      ||[...row.querySelectorAll('button')].find(b=>/manage/i.test(b.getAttribute('aria-label')||b.title||''));
 }
 function isManageButtonActive(button){return !!button?.querySelector('span[class*="active___"]')||button?.getAttribute('aria-expanded')==='true';}
 function findMobileMenu(row){
@@ -172,33 +213,48 @@ async function markForRemoval(entry){
 }
 async function fillManagePage(ctx){
   const rows=getManageRows();if(!rows.length)return null;
-  let repriced=0,removed=0,failed=0,skipped=0;
+  let repriced=0,removed=0,failed=0,skipped=0,rwSkipped=0,dollarSkipped=0;
   for(let i=0;i<rows.length;i++){
+    if(isRankedWarRow(rows[i].row)){
+      rwSkipped++;
+      console.info(`[${SCRIPT}] SKIP RW ${rows[i].name}`);
+      continue;
+    }
     setButtonState(`OPENING ${i+1}/${rows.length}…`,true);
     let handle=null;
     try{
       handle=await openManageRow(rows[i]);
+      const currentPrice=parseMoneyValue(handle.input);
+      if(currentPrice===1){
+        dollarSkipped++;
+        console.info(`[${SCRIPT}] SKIP $1 ${rows[i].name}`);
+        continue;
+      }
       setButtonState(`CHECKING ${i+1}/${rows.length}…`,true);
       const baz=await getBazaarPrice(rows[i].itemId,ctx.playerId);
       const city=getCitySell(ctx.items,rows[i].itemId);
       if(city>baz.listPrice){
         await markForRemoval(rows[i]);removed++;
-        console.info(`[${SCRIPT}] REMOVE ${rows[i].name}: city $${city} > bazaar $${baz.listPrice}`);
+        console.info(`[${SCRIPT}] REMOVE ${rows[i].name}: city $${city} > safe bazaar $${baz.listPrice}`);
       }else{
         setControlledInput(handle.input,baz.listPrice);repriced++;
+        console.info(`[${SCRIPT}] PRICE ${rows[i].name}: $${baz.listPrice} | base $${baz.targetBase} avg $${Math.round(baz.average)} med $${Math.round(baz.median)}`);
       }
       await sleep(100);
     }catch(e){
-      if(/No usable competitor bazaar listings/.test(String(e?.message||'')))skipped++;else failed++;
+      if(/No sane competitor bazaar listings/.test(String(e?.message||'')))skipped++;else failed++;
       console.warn(`[${SCRIPT}] ${rows[i].name} (${rows[i].itemId})`,e);
     }finally{await closeManageRow(handle);}
     await sleep(100);
   }
-  return {mode:'manage',repriced,removed,failed,skipped,total:rows.length};
+  return {mode:'manage',repriced,removed,failed,skipped,rwSkipped,dollarSkipped,total:rows.length};
 }
 
 // ---------- Add Items ----------
-function getAddRows(){return [...document.querySelectorAll('ul.items-cont li.clearfix, div[class*="itemsContainner___"] div[class*="item___"], div[class*="rowItems___"] div[class*="item___"]')].filter(r=>visible(r)&&r.querySelector('div.amount-main-wrap, div[class*="amount___"]')&&itemIdFrom(r));}
+function getAddRows(){
+  return [...document.querySelectorAll('ul.items-cont li.clearfix, div[class*="itemsContainner___"] div[class*="item___"], div[class*="rowItems___"] div[class*="item___"]')]
+    .filter(r=>visible(r)&&r.querySelector('div.amount-main-wrap, div[class*="amount___"]')&&itemIdFrom(r));
+}
 function addControls(row){
   const amount=row.querySelector('div.amount-main-wrap, div[class*="amount___"]');
   const price=row.querySelector('div.price, div[class*="price___"]');
@@ -218,28 +274,40 @@ function maxQty(c){
 }
 async function fillAddPage(ctx){
   const rows=getAddRows().map(addControls).filter(Boolean);if(!rows.length)return null;
-  let filled=0,cityBetter=0,skipped=0,failed=0;
+  let filled=0,cityBetter=0,skipped=0,failed=0,rwSkipped=0,dollarSkipped=0;
   for(let i=0;i<rows.length;i++){
+    if(isRankedWarRow(rows[i].row)){rwSkipped++;continue;}
+    if(rows[i].priceInputs.some(x=>parseMoneyValue(x)===1)){dollarSkipped++;continue;}
     setButtonState(`FILLING ${i+1}/${rows.length}…`,true);
     try{
       const q=maxQty(rows[i]);if(!q){skipped++;continue;}
       const baz=await getBazaarPrice(rows[i].itemId,ctx.playerId);
       const city=getCitySell(ctx.items,rows[i].itemId);
       if(city>baz.listPrice){cityBetter++;continue;}
-      if(rows[i].checkbox&&!rows[i].checkbox.checked)rows[i].checkbox.click(); else if(rows[i].qty)setControlledInput(rows[i].qty,q);
+      if(rows[i].checkbox&&!rows[i].checkbox.checked)rows[i].checkbox.click();else if(rows[i].qty)setControlledInput(rows[i].qty,q);
       rows[i].priceInputs.forEach(x=>setControlledInput(x,baz.listPrice));filled++;
     }catch(e){
-      if(/No usable competitor bazaar listings/.test(String(e?.message||'')))skipped++;else failed++;
+      if(/No sane competitor bazaar listings/.test(String(e?.message||'')))skipped++;else failed++;
       console.warn(`[${SCRIPT}] add item ${rows[i].itemId}`,e);
     }
     await sleep(100);
   }
-  return {mode:'add',filled,cityBetter,skipped,failed,total:rows.length};
+  return {mode:'add',filled,cityBetter,skipped,failed,rwSkipped,dollarSkipped,total:rows.length};
 }
 
-function setButtonState(text,disabled=false){const b=document.getElementById('cbf-fill-page');if(!b)return;b.textContent=text;b.disabled=disabled;b.style.opacity=disabled?'.7':'1';}
+function setButtonState(text,disabled=false){
+  const b=document.getElementById('cbf-fill-page');if(!b)return;
+  b.textContent=text;b.disabled=disabled;b.style.opacity=disabled?'.7':'1';
+}
 function toast(msg,type='ok'){
-  let b=document.getElementById('cbf-toast');if(!b){b=document.createElement('div');b.id='cbf-toast';Object.assign(b.style,{position:'fixed',left:'12px',right:'12px',bottom:'76px',zIndex:'2147483647',padding:'11px 14px',borderRadius:'10px',fontSize:'13px',fontWeight:'700',textAlign:'center',color:'#fff',boxShadow:'0 4px 14px rgba(0,0,0,.35)',pointerEvents:'none'});document.body.appendChild(b);}b.style.background=type==='error'?'#a82c2c':type==='warn'?'#8a6515':'#287842';b.textContent=msg;b.style.opacity='1';clearTimeout(b._t);b._t=setTimeout(()=>b.style.opacity='0',6000);
+  let b=document.getElementById('cbf-toast');
+  if(!b){
+    b=document.createElement('div');b.id='cbf-toast';
+    Object.assign(b.style,{position:'fixed',left:'12px',right:'12px',bottom:'76px',zIndex:'2147483647',padding:'11px 14px',borderRadius:'10px',fontSize:'13px',fontWeight:'700',textAlign:'center',color:'#fff',boxShadow:'0 4px 14px rgba(0,0,0,.35)',pointerEvents:'none'});
+    document.body.appendChild(b);
+  }
+  b.style.background=type==='error'?'#a82c2c':type==='warn'?'#8a6515':'#287842';
+  b.textContent=msg;b.style.opacity='1';clearTimeout(b._t);b._t=setTimeout(()=>b.style.opacity='0',7000);
 }
 async function fillPage(){
   if(busy)return;busy=true;setButtonState('LOADING PRICES…',true);
@@ -251,10 +319,18 @@ async function fillPage(){
     if(!result){toast('No editable Bazaar rows found on this screen.','warn');return;}
     if(result.mode==='manage'){
       const bits=[`${result.repriced} repriced`,`${result.removed} marked for removal`];
-      if(result.skipped)bits.push(`${result.skipped} skipped`);if(result.failed)bits.push(`${result.failed} failed`);
+      if(result.rwSkipped)bits.push(`${result.rwSkipped} RW skipped`);
+      if(result.dollarSkipped)bits.push(`${result.dollarSkipped} $1 skipped`);
+      if(result.skipped)bits.push(`${result.skipped} no safe price`);
+      if(result.failed)bits.push(`${result.failed} failed`);
       toast(`${bits.join(' • ')}. Review, then tap SAVE CHANGES.`,result.failed?'warn':'ok');
     }else{
-      const bits=[`${result.filled} filled`];if(result.cityBetter)bits.push(`${result.cityBetter} better sold to city`);if(result.skipped)bits.push(`${result.skipped} skipped`);if(result.failed)bits.push(`${result.failed} failed`);
+      const bits=[`${result.filled} filled`];
+      if(result.cityBetter)bits.push(`${result.cityBetter} better sold to city`);
+      if(result.rwSkipped)bits.push(`${result.rwSkipped} RW skipped`);
+      if(result.dollarSkipped)bits.push(`${result.dollarSkipped} $1 skipped`);
+      if(result.skipped)bits.push(`${result.skipped} no safe price`);
+      if(result.failed)bits.push(`${result.failed} failed`);
       toast(bits.join(' • '),result.failed?'warn':'ok');
     }
   }catch(e){console.error(`[${SCRIPT}]`,e);toast(e.message||'Fill failed.','error');}
@@ -262,11 +338,23 @@ async function fillPage(){
 }
 function injectUI(){
   if(document.getElementById('cbf-fill-page'))return;
-  const w=document.createElement('div');w.id='cbf-wrap';Object.assign(w.style,{position:'fixed',left:'10px',right:'10px',bottom:'12px',zIndex:'2147483646',display:'flex',gap:'8px',alignItems:'stretch',maxWidth:'680px',margin:'0 auto'});
-  const b=document.createElement('button');b.id='cbf-fill-page';b.type='button';b.textContent='FILL THIS PAGE';Object.assign(b.style,{flex:'1 1 auto',minHeight:'52px',border:'0',borderRadius:'12px',background:'linear-gradient(180deg,#2f9b56,#247642)',color:'#fff',fontSize:'16px',fontWeight:'900',letterSpacing:'.3px',boxShadow:'0 4px 16px rgba(0,0,0,.4)',touchAction:'manipulation'});b.addEventListener('click',fillPage);
-  const g=document.createElement('button');g.type='button';g.textContent='⚙';Object.assign(g.style,{width:'52px',minHeight:'52px',border:'0',borderRadius:'12px',background:'#333',color:'#fff',fontSize:'22px',fontWeight:'700',boxShadow:'0 4px 16px rgba(0,0,0,.4)',touchAction:'manipulation'});g.addEventListener('click',()=>{const v=prompt('Undercut the cheapest competing WEAV3R bazaar listing by how many dollars?',String(getUndercut()));if(v===null)return;const n=Number(v.replace(/,/g,'').trim());if(!Number.isFinite(n)||n<0)return toast('Enter a valid non-negative dollar amount.','error');localStorage.setItem(UNDERCUT_STORAGE,String(Math.floor(n)));toast(`Bazaar undercut set to $${Math.floor(n).toLocaleString()}.`);});
+  const w=document.createElement('div');w.id='cbf-wrap';
+  Object.assign(w.style,{position:'fixed',left:'10px',right:'10px',bottom:'12px',zIndex:'2147483646',display:'flex',gap:'8px',alignItems:'stretch',maxWidth:'680px',margin:'0 auto'});
+  const b=document.createElement('button');b.id='cbf-fill-page';b.type='button';b.textContent='FILL THIS PAGE';
+  Object.assign(b.style,{flex:'1 1 auto',minHeight:'52px',border:'0',borderRadius:'12px',background:'linear-gradient(180deg,#2f9b56,#247642)',color:'#fff',fontSize:'16px',fontWeight:'900',letterSpacing:'.3px',boxShadow:'0 4px 16px rgba(0,0,0,.4)',touchAction:'manipulation'});
+  b.addEventListener('click',fillPage);
+  const g=document.createElement('button');g.type='button';g.textContent='⚙';
+  Object.assign(g.style,{width:'52px',minHeight:'52px',border:'0',borderRadius:'12px',background:'#333',color:'#fff',fontSize:'22px',fontWeight:'700',boxShadow:'0 4px 16px rgba(0,0,0,.4)',touchAction:'manipulation'});
+  g.addEventListener('click',()=>{
+    const v=prompt('Undercut the safe competing WEAV3R bazaar target by how many dollars?',String(getUndercut()));if(v===null)return;
+    const n=Number(v.replace(/,/g,'').trim());if(!Number.isFinite(n)||n<0)return toast('Enter a valid non-negative dollar amount.','error');
+    localStorage.setItem(UNDERCUT_STORAGE,String(Math.floor(n)));toast(`Bazaar undercut set to $${Math.floor(n).toLocaleString()}.`);
+  });
   w.append(b,g);document.body.appendChild(w);
 }
-function boot(){injectUI();new MutationObserver(injectUI).observe(document.documentElement,{childList:true,subtree:true});console.log(`[${SCRIPT}] Loaded v0.4.0`);}
+function boot(){
+  injectUI();new MutationObserver(injectUI).observe(document.documentElement,{childList:true,subtree:true});
+  console.log(`[${SCRIPT}] Loaded v0.5.0`);
+}
 if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',boot,{once:true});else boot();
 })();
