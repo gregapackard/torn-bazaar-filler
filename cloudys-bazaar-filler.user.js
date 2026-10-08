@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Cloudy's Bazaar Filler
 // @namespace    https://github.com/gregapackard/torn-bazaar-filler
-// @version      0.3.1
-// @description  PDA-first Torn bazaar filler/repricer. One button fills Add Items or opens and reprices each visible Manage Items row on mobile.
+// @version      0.4.0
+// @description  PDA-first Torn bazaar repricer. Uses live Weav3r bazaar listings, excludes your own listing when possible, and marks items for removal when Torn's city sell price beats the bazaar price.
 // @author       CloudyMuffin440 [4315564]
 // @license      MIT
 // @match        https://www.torn.com/bazaar.php*
@@ -10,6 +10,7 @@
 // @run-at       document-idle
 // @grant        GM_xmlhttpRequest
 // @connect      api.torn.com
+// @connect      weav3r.dev
 // @updateURL    https://raw.githubusercontent.com/gregapackard/torn-bazaar-filler/main/cloudys-bazaar-filler.user.js
 // @downloadURL  https://raw.githubusercontent.com/gregapackard/torn-bazaar-filler/main/cloudys-bazaar-filler.user.js
 // ==/UserScript==
@@ -21,6 +22,8 @@ const SCRIPT='CloudyBazaarFiller';
 const API_KEY_STORAGE='cloudys-bazaar-filler-api-key';
 const UNDERCUT_STORAGE='cloudys-bazaar-filler-undercut';
 const DEFAULT_UNDERCUT=1;
+const WEAV3R_STALE_MS=30*60*1000;
+const BAZAAR_SANITY_FLOOR_RATIO=0.25;
 let busy=false;
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 
@@ -48,16 +51,42 @@ function getApiKey(){
   localStorage.setItem(API_KEY_STORAGE,key);return key;
 }
 function getUndercut(){const n=Number(localStorage.getItem(UNDERCUT_STORAGE));return Number.isFinite(n)&&n>=0?Math.floor(n):DEFAULT_UNDERCUT;}
-function apiGet(url){return new Promise((resolve,reject)=>GM_xmlhttpRequest({method:'GET',url,timeout:12000,onload:r=>{try{const d=JSON.parse(r.responseText);d?.error?reject(new Error(d.error.error||`Torn API error ${d.error.code}`)):resolve(d);}catch(e){reject(e)}},onerror:()=>reject(new Error('Network error contacting Torn API.')),ontimeout:()=>reject(new Error('Torn API request timed out.'))}));}
-async function getLowestMarketPrice(itemId,key){
-  const d=await apiGet(`https://api.torn.com/v2/market/${encodeURIComponent(itemId)}/itemmarket?key=${encodeURIComponent(key)}&offset=0`);
-  const root=d?.itemmarket||d?.itemMarket||d?.item_market||d;
-  const listings=Array.isArray(root)?root:(root?.listings||root?.items||root?.results||[]);
-  const prices=Array.isArray(listings)
-    ? listings.map(x=>Number(x?.price)).filter(x=>Number.isFinite(x)&&x>0).sort((a,b)=>a-b)
-    : [];
-  if(!prices.length)throw new Error(`No Item Market listings found for item ${itemId}.`);
-  return prices[0];
+function requestJson(url){
+  return new Promise((resolve,reject)=>GM_xmlhttpRequest({
+    method:'GET',url,timeout:15000,
+    onload:r=>{try{const d=JSON.parse(r.responseText);d?.error?reject(new Error(d.error.error||`API error ${d.error.code}`)):resolve(d);}catch(e){reject(e)}},
+    onerror:()=>reject(new Error('Network error.')),
+    ontimeout:()=>reject(new Error('Request timed out.'))
+  }));
+}
+async function loadRunContext(key){
+  const [itemsData,userData]=await Promise.all([
+    requestJson(`https://api.torn.com/torn/?selections=items&key=${encodeURIComponent(key)}&comment=CloudysBazaarFiller`),
+    requestJson(`https://api.torn.com/user/?selections=basic&key=${encodeURIComponent(key)}&comment=CloudysBazaarFiller`)
+  ]);
+  return {items:itemsData?.items||{}, playerId:Number(userData?.player_id)||null};
+}
+function normaliseWeav3rListings(data,playerId){
+  const all=Array.isArray(data?.listings)?data.listings:[];
+  const avg=Number(data?.bazaar_average)||0;
+  const floor=avg>0?avg*BAZAAR_SANITY_FLOOR_RATIO:0;
+  let usable=all.filter(x=>Number(x?.price)>0 && x?.sponsored!==1 && Number(x.price)>=floor);
+  if(playerId)usable=usable.filter(x=>Number(x?.player_id)!==playerId);
+  const fresh=usable.filter(x=>!x?.last_checked || Date.now()-(Number(x.last_checked)*1000)<=WEAV3R_STALE_MS);
+  usable=fresh.length?fresh:usable;
+  return usable.sort((a,b)=>Number(a.price)-Number(b.price));
+}
+async function getBazaarPrice(itemId,playerId){
+  const d=await requestJson(`https://weav3r.dev/api/marketplace/${encodeURIComponent(itemId)}`);
+  const listings=normaliseWeav3rListings(d,playerId);
+  if(!listings.length)throw new Error(`No usable competitor bazaar listings for item ${itemId}.`);
+  const lowest=Number(listings[0].price);
+  return {lowest,listPrice:Math.max(1,lowest-getUndercut()),listings};
+}
+function getCitySell(items,itemId){
+  const item=items?.[itemId]||items?.[String(itemId)]||null;
+  const n=Number(item?.sell_price);
+  return Number.isFinite(n)&&n>0?n:0;
 }
 function itemIdFrom(el){
   const img=el?.querySelector('img[src*="/items/"], img'); if(!img)return null;
@@ -69,7 +98,7 @@ function itemName(el){
   const txt=(el?.innerText||'').split('\n').map(x=>x.trim()).filter(Boolean);
   return txt.find(x=>!/^x?\d+$/.test(x)&&!/^\$/.test(x))||'item';
 }
-async function waitFor(fn,timeout=1800,interval=40){
+async function waitFor(fn,timeout=2200,interval=40){
   const end=Date.now()+timeout;
   while(Date.now()<end){const v=fn();if(v)return v;await sleep(interval);}return null;
 }
@@ -84,10 +113,8 @@ function getManageRows(){
   for(const desc of descs){
     const row=desc.closest('div[data-testid="sortable-item"], div[class*="row___"]')||desc.parentElement?.parentElement;
     if(!row||!visible(row))continue;
-    const id=itemIdFrom(row);
-    if(!id||seen.has(id))continue;
-    seen.add(id);
-    out.push({row,desc,itemId:id,name:itemName(row)});
+    const id=itemIdFrom(row);if(!id||seen.has(id))continue;
+    seen.add(id);out.push({row,desc,itemId:id,name:itemName(row)});
   }
   return out;
 }
@@ -96,65 +123,78 @@ function getManageButton(row){
       || row.querySelector('button[aria-label="Manage"]')
       || [...row.querySelectorAll('button')].find(b=>/manage/i.test(b.getAttribute('aria-label')||b.title||''));
 }
-function isManageButtonActive(button){
-  return !!button?.querySelector('span[class*="active___"]') || button?.getAttribute('aria-expanded')==='true';
-}
-function findMobilePriceInput(row){
+function isManageButtonActive(button){return !!button?.querySelector('span[class*="active___"]')||button?.getAttribute('aria-expanded')==='true';}
+function findMobileMenu(row){
   const parent=row.parentElement;
-  const scopes=[parent,row,document];
-  for(const scope of scopes){
-    if(!scope)continue;
-    const box=scope.querySelector('[class*="bottomMobileMenu___"] [class*="priceMobile___"]');
-    if(box){
-      const input=box.querySelector('div.input-money-group input, input');
-      if(input&&visible(input))return input;
-    }
+  for(const scope of [parent,row,document]){
+    const menu=scope?.querySelector('[class*="bottomMobileMenu___"]');
+    if(menu&&visible(menu))return menu;
   }
   return null;
+}
+function findMobilePriceInput(row){
+  const menu=findMobileMenu(row);if(!menu)return null;
+  const box=menu.querySelector('[class*="priceMobile___"]');
+  const input=box?.querySelector('div.input-money-group input, input');
+  return input&&visible(input)?input:null;
+}
+function findRemoveInput(row){
+  const menu=findMobileMenu(row);
+  const scopes=[menu,row,row.parentElement].filter(Boolean);
+  for(const scope of scopes){
+    const input=scope.querySelector('[class*="remove___"] input, [class*="removeMobile___"] input, input[name*="remove" i]');
+    if(input)return input;
+  }
+  return null;
+}
+function parseListedQty(row,removeInput){
+  const max=Number(removeInput?.max);if(Number.isFinite(max)&&max>0)return Math.floor(max);
+  const text=row?.innerText||'';
+  const hit=text.match(/x\s*([\d,]+)/i)||text.match(/(?:quantity|qty|listed)\D{0,12}([\d,]+)/i);
+  return hit?Number(hit[1].replace(/,/g,'')):1;
 }
 async function openManageRow(entry){
   let input=findMobilePriceInput(entry.row);
   if(input)return {input,button:getManageButton(entry.row),openedByUs:false};
-
-  const button=getManageButton(entry.row);
-  if(!button)throw new Error('Manage button not found');
-  const wasActive=isManageButtonActive(button);
-  if(!wasActive)button.click();
-
-  input=await waitFor(()=>findMobilePriceInput(entry.row),2200,50);
+  const button=getManageButton(entry.row);if(!button)throw new Error('Manage button not found');
+  const wasActive=isManageButtonActive(button);if(!wasActive)button.click();
+  input=await waitFor(()=>findMobilePriceInput(entry.row));
   if(!input)throw new Error('Mobile price panel did not open');
   return {input,button,openedByUs:!wasActive};
 }
-async function closeManageRow(handle){
-  if(!handle?.openedByUs||!handle.button)return;
-  handle.button.click();
-  await sleep(90);
+async function closeManageRow(handle){if(handle?.openedByUs&&handle.button){handle.button.click();await sleep(100);}}
+async function markForRemoval(entry){
+  const removeInput=await waitFor(()=>findRemoveInput(entry.row),1000,40);
+  if(!removeInput)throw new Error('Remove quantity input not found');
+  const qty=parseListedQty(entry.row,removeInput);
+  setControlledInput(removeInput,qty);
+  return qty;
 }
-async function fillManagePage(key){
-  const rows=getManageRows();
-  if(!rows.length)return null;
-  let filled=0,failed=0;
-
+async function fillManagePage(ctx){
+  const rows=getManageRows();if(!rows.length)return null;
+  let repriced=0,removed=0,failed=0,skipped=0;
   for(let i=0;i<rows.length;i++){
     setButtonState(`OPENING ${i+1}/${rows.length}…`,true);
     let handle=null;
     try{
       handle=await openManageRow(rows[i]);
-      setButtonState(`PRICING ${i+1}/${rows.length}…`,true);
-      const low=await getLowestMarketPrice(rows[i].itemId,key);
-      const price=Math.max(1,low-getUndercut());
-      setControlledInput(handle.input,price);
+      setButtonState(`CHECKING ${i+1}/${rows.length}…`,true);
+      const baz=await getBazaarPrice(rows[i].itemId,ctx.playerId);
+      const city=getCitySell(ctx.items,rows[i].itemId);
+      if(city>baz.listPrice){
+        await markForRemoval(rows[i]);removed++;
+        console.info(`[${SCRIPT}] REMOVE ${rows[i].name}: city $${city} > bazaar $${baz.listPrice}`);
+      }else{
+        setControlledInput(handle.input,baz.listPrice);repriced++;
+      }
       await sleep(100);
-      filled++;
     }catch(e){
-      failed++;
+      if(/No usable competitor bazaar listings/.test(String(e?.message||'')))skipped++;else failed++;
       console.warn(`[${SCRIPT}] ${rows[i].name} (${rows[i].itemId})`,e);
-    }finally{
-      await closeManageRow(handle);
-    }
-    await sleep(90);
+    }finally{await closeManageRow(handle);}
+    await sleep(100);
   }
-  return {mode:'manage',filled,failed,total:rows.length};
+  return {mode:'manage',repriced,removed,failed,skipped,total:rows.length};
 }
 
 // ---------- Add Items ----------
@@ -176,36 +216,47 @@ function maxQty(c){
   const hit=text.match(/x\s*([\d,]+)/i)||text.match(/(?:owned|available|max)\D{0,12}([\d,]+)/i);
   return hit?Number(hit[1].replace(/,/g,'')):null;
 }
-async function fillAddPage(key){
-  const rows=getAddRows().map(addControls).filter(Boolean);
-  if(!rows.length)return null;
-  let filled=0,skipped=0,failed=0;
+async function fillAddPage(ctx){
+  const rows=getAddRows().map(addControls).filter(Boolean);if(!rows.length)return null;
+  let filled=0,cityBetter=0,skipped=0,failed=0;
   for(let i=0;i<rows.length;i++){
     setButtonState(`FILLING ${i+1}/${rows.length}…`,true);
     try{
       const q=maxQty(rows[i]);if(!q){skipped++;continue;}
-      const low=await getLowestMarketPrice(rows[i].itemId,key),price=Math.max(1,low-getUndercut());
+      const baz=await getBazaarPrice(rows[i].itemId,ctx.playerId);
+      const city=getCitySell(ctx.items,rows[i].itemId);
+      if(city>baz.listPrice){cityBetter++;continue;}
       if(rows[i].checkbox&&!rows[i].checkbox.checked)rows[i].checkbox.click(); else if(rows[i].qty)setControlledInput(rows[i].qty,q);
-      rows[i].priceInputs.forEach(x=>setControlledInput(x,price));filled++;
-    }catch(e){failed++;console.warn(`[${SCRIPT}] add item ${rows[i].itemId}`,e);}
-    await sleep(90);
+      rows[i].priceInputs.forEach(x=>setControlledInput(x,baz.listPrice));filled++;
+    }catch(e){
+      if(/No usable competitor bazaar listings/.test(String(e?.message||'')))skipped++;else failed++;
+      console.warn(`[${SCRIPT}] add item ${rows[i].itemId}`,e);
+    }
+    await sleep(100);
   }
-  return {mode:'add',filled,skipped,failed,total:rows.length};
+  return {mode:'add',filled,cityBetter,skipped,failed,total:rows.length};
 }
 
 function setButtonState(text,disabled=false){const b=document.getElementById('cbf-fill-page');if(!b)return;b.textContent=text;b.disabled=disabled;b.style.opacity=disabled?'.7':'1';}
 function toast(msg,type='ok'){
-  let b=document.getElementById('cbf-toast');if(!b){b=document.createElement('div');b.id='cbf-toast';Object.assign(b.style,{position:'fixed',left:'12px',right:'12px',bottom:'76px',zIndex:'2147483647',padding:'11px 14px',borderRadius:'10px',fontSize:'13px',fontWeight:'700',textAlign:'center',color:'#fff',boxShadow:'0 4px 14px rgba(0,0,0,.35)',pointerEvents:'none'});document.body.appendChild(b);}b.style.background=type==='error'?'#a82c2c':type==='warn'?'#8a6515':'#287842';b.textContent=msg;b.style.opacity='1';clearTimeout(b._t);b._t=setTimeout(()=>b.style.opacity='0',4500);
+  let b=document.getElementById('cbf-toast');if(!b){b=document.createElement('div');b.id='cbf-toast';Object.assign(b.style,{position:'fixed',left:'12px',right:'12px',bottom:'76px',zIndex:'2147483647',padding:'11px 14px',borderRadius:'10px',fontSize:'13px',fontWeight:'700',textAlign:'center',color:'#fff',boxShadow:'0 4px 14px rgba(0,0,0,.35)',pointerEvents:'none'});document.body.appendChild(b);}b.style.background=type==='error'?'#a82c2c':type==='warn'?'#8a6515':'#287842';b.textContent=msg;b.style.opacity='1';clearTimeout(b._t);b._t=setTimeout(()=>b.style.opacity='0',6000);
 }
 async function fillPage(){
-  if(busy)return;busy=true;setButtonState('SCANNING…',true);
+  if(busy)return;busy=true;setButtonState('LOADING PRICES…',true);
   try{
     const key=getApiKey();
-    let result=await fillManagePage(key);
-    if(!result)result=await fillAddPage(key);
+    const ctx=await loadRunContext(key);
+    let result=await fillManagePage(ctx);
+    if(!result)result=await fillAddPage(ctx);
     if(!result){toast('No editable Bazaar rows found on this screen.','warn');return;}
-    if(result.mode==='manage')toast(`${result.filled}/${result.total} prices filled${result.failed?` • ${result.failed} failed`:''}. Review, then tap SAVE CHANGES.`,result.failed?'warn':'ok');
-    else toast(`${result.filled}/${result.total} filled${result.skipped?` • ${result.skipped} skipped`:''}${result.failed?` • ${result.failed} failed`:''}`,result.failed?'warn':'ok');
+    if(result.mode==='manage'){
+      const bits=[`${result.repriced} repriced`,`${result.removed} marked for removal`];
+      if(result.skipped)bits.push(`${result.skipped} skipped`);if(result.failed)bits.push(`${result.failed} failed`);
+      toast(`${bits.join(' • ')}. Review, then tap SAVE CHANGES.`,result.failed?'warn':'ok');
+    }else{
+      const bits=[`${result.filled} filled`];if(result.cityBetter)bits.push(`${result.cityBetter} better sold to city`);if(result.skipped)bits.push(`${result.skipped} skipped`);if(result.failed)bits.push(`${result.failed} failed`);
+      toast(bits.join(' • '),result.failed?'warn':'ok');
+    }
   }catch(e){console.error(`[${SCRIPT}]`,e);toast(e.message||'Fill failed.','error');}
   finally{busy=false;setButtonState('FILL THIS PAGE');}
 }
@@ -213,9 +264,9 @@ function injectUI(){
   if(document.getElementById('cbf-fill-page'))return;
   const w=document.createElement('div');w.id='cbf-wrap';Object.assign(w.style,{position:'fixed',left:'10px',right:'10px',bottom:'12px',zIndex:'2147483646',display:'flex',gap:'8px',alignItems:'stretch',maxWidth:'680px',margin:'0 auto'});
   const b=document.createElement('button');b.id='cbf-fill-page';b.type='button';b.textContent='FILL THIS PAGE';Object.assign(b.style,{flex:'1 1 auto',minHeight:'52px',border:'0',borderRadius:'12px',background:'linear-gradient(180deg,#2f9b56,#247642)',color:'#fff',fontSize:'16px',fontWeight:'900',letterSpacing:'.3px',boxShadow:'0 4px 16px rgba(0,0,0,.4)',touchAction:'manipulation'});b.addEventListener('click',fillPage);
-  const g=document.createElement('button');g.type='button';g.textContent='⚙';Object.assign(g.style,{width:'52px',minHeight:'52px',border:'0',borderRadius:'12px',background:'#333',color:'#fff',fontSize:'22px',fontWeight:'700',boxShadow:'0 4px 16px rgba(0,0,0,.4)',touchAction:'manipulation'});g.addEventListener('click',()=>{const v=prompt('Undercut the cheapest Item Market listing by how many dollars?',String(getUndercut()));if(v===null)return;const n=Number(v.replace(/,/g,'').trim());if(!Number.isFinite(n)||n<0)return toast('Enter a valid non-negative dollar amount.','error');localStorage.setItem(UNDERCUT_STORAGE,String(Math.floor(n)));toast(`Undercut set to $${Math.floor(n).toLocaleString()}.`);});
+  const g=document.createElement('button');g.type='button';g.textContent='⚙';Object.assign(g.style,{width:'52px',minHeight:'52px',border:'0',borderRadius:'12px',background:'#333',color:'#fff',fontSize:'22px',fontWeight:'700',boxShadow:'0 4px 16px rgba(0,0,0,.4)',touchAction:'manipulation'});g.addEventListener('click',()=>{const v=prompt('Undercut the cheapest competing WEAV3R bazaar listing by how many dollars?',String(getUndercut()));if(v===null)return;const n=Number(v.replace(/,/g,'').trim());if(!Number.isFinite(n)||n<0)return toast('Enter a valid non-negative dollar amount.','error');localStorage.setItem(UNDERCUT_STORAGE,String(Math.floor(n)));toast(`Bazaar undercut set to $${Math.floor(n).toLocaleString()}.`);});
   w.append(b,g);document.body.appendChild(w);
 }
-function boot(){injectUI();new MutationObserver(injectUI).observe(document.documentElement,{childList:true,subtree:true});console.log(`[${SCRIPT}] Loaded v0.3.1`);}
+function boot(){injectUI();new MutationObserver(injectUI).observe(document.documentElement,{childList:true,subtree:true});console.log(`[${SCRIPT}] Loaded v0.4.0`);}
 if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',boot,{once:true});else boot();
 })();
