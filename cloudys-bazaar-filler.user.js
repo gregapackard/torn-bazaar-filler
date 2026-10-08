@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Cloudy's Bazaar Filler
 // @namespace    https://github.com/gregapackard/torn-bazaar-filler
-// @version      0.8.0
-// @description  PDA-first Torn bazaar repricer using Weav3r first, competitive Item Market fallback, RW/$1 protection, city-sell checks, and Nikeh removal.
+// @version      0.9.0
+// @description  PDA-first Torn bazaar repricer using Weav3r first, competitive Item Market fallback, hard market-value cap, RW/$1 protection, city-sell checks, and Nikeh removal.
 // @author       CloudyMuffin440 [4315564]
 // @license      MIT
 // @match        https://www.torn.com/bazaar.php*
@@ -95,7 +95,7 @@ function pickCompetitiveBase(prices,{anchor=0,anchorFloor=0.60,medianFloor=0.70}
   if(!sorted.length)return null;
   const med=median(sorted);
   const floor=Math.max(anchor>0?anchor*anchorFloor:0,med>0?med*medianFloor:0);
-  let sane=sorted.filter(p=>p>=floor);
+  const sane=sorted.filter(p=>p>=floor);
   if(!sane.length)return null;
   let index=0;
   if(sane.length>=3){
@@ -137,21 +137,32 @@ async function getItemMarketFallback(itemId,ctx){
   const prices=parseItemMarketListings(d);
   const picked=pickCompetitiveBase(prices,{anchor:marketValue,anchorFloor:0.70,medianFloor:0.75});
   if(picked?.base){
-    if(marketValue>0 && picked.base>marketValue*1.25 && prices.length<5)throw new Error('Sparse Item Market is too far above market value');
     return {source:'itemmarket',targetBase:picked.base,listPrice:Math.max(2,Math.floor(picked.base-getUndercut())),marketValue,median:picked.median,floor:picked.floor};
   }
   if(marketValue>1){
-    const base=Math.max(2,Math.floor(marketValue*0.99));
+    const base=Math.max(2,Math.floor(marketValue));
     return {source:'marketvalue',targetBase:base,listPrice:Math.max(2,base-getUndercut()),marketValue};
   }
   throw new Error('No safe fallback price');
 }
+function applyHardMarketCap(result,itemId,ctx){
+  const marketValue=getMarketValue(ctx.items,itemId);
+  if(!(marketValue>1))return {...result,marketValue:result.marketValue||0,marketCapApplied:false};
+  const cap=Math.max(2,Math.floor(marketValue-getUndercut()));
+  const original=Number(result.listPrice)||0;
+  if(original>cap){
+    return {...result,listPrice:cap,marketValue,marketCapApplied:true,uncappedPrice:original};
+  }
+  return {...result,marketValue,marketCapApplied:false};
+}
 async function getSafePrice(itemId,ctx){
-  try{return await getWeav3rPrice(itemId,ctx);}
+  let result;
+  try{result=await getWeav3rPrice(itemId,ctx);}
   catch(e){
     console.info(`[${SCRIPT}] Weaver unavailable/unsafe for ${itemId}; falling back.`,e?.message||e);
-    return getItemMarketFallback(itemId,ctx);
+    result=await getItemMarketFallback(itemId,ctx);
   }
+  return applyHardMarketCap(result,itemId,ctx);
 }
 function itemIdFrom(el){
   const img=el?.querySelector('img[src*="/items/"], img');
@@ -233,7 +244,7 @@ async function markForRemoval(entry){
 }
 async function fillManagePage(ctx){
   const rows=getManageRows();if(!rows.length)return null;
-  let repriced=0,removed=0,nikehRemoved=0,skipped=0,rwSkipped=0,dollarSkipped=0,itemMarketFallback=0,marketValueFallback=0;
+  let repriced=0,removed=0,nikehRemoved=0,skipped=0,rwSkipped=0,dollarSkipped=0,itemMarketFallback=0,marketValueFallback=0,marketCapped=0;
   for(let i=0;i<rows.length;i++){
     if(isRankedWarRow(rows[i].row)){rwSkipped++;continue;}
     setButtonState(`OPENING ${i+1}/${rows.length}…`,true);
@@ -247,15 +258,16 @@ async function fillManagePage(ctx){
       const safe=await getSafePrice(rows[i].itemId,ctx);
       if(safe.source==='itemmarket')itemMarketFallback++;
       if(safe.source==='marketvalue')marketValueFallback++;
+      if(safe.marketCapApplied)marketCapped++;
       const city=getCitySell(ctx.items,rows[i].itemId);
       if(city>safe.listPrice){await markForRemoval(rows[i]);removed++;}
       else{setControlledInput(handle.input,safe.listPrice);repriced++;}
-      console.info(`[${SCRIPT}] ${rows[i].name}: ${safe.source} -> $${safe.listPrice}`);
+      console.info(`[${SCRIPT}] ${rows[i].name}: ${safe.source} -> $${safe.listPrice}${safe.marketCapApplied?` (capped from $${safe.uncappedPrice} at market value $${safe.marketValue})`:''}`);
     }catch(e){skipped++;console.warn(`[${SCRIPT}] ${rows[i].name} (${rows[i].itemId})`,e);}
     finally{await closeManageRow(handle);}
     await sleep(100);
   }
-  return {mode:'manage',repriced,removed,nikehRemoved,skipped,rwSkipped,dollarSkipped,itemMarketFallback,marketValueFallback,total:rows.length};
+  return {mode:'manage',repriced,removed,nikehRemoved,skipped,rwSkipped,dollarSkipped,itemMarketFallback,marketValueFallback,marketCapped,total:rows.length};
 }
 function getAddRows(){return [...document.querySelectorAll('ul.items-cont li.clearfix, div[class*="itemsContainner___"] div[class*="item___"], div[class*="rowItems___"] div[class*="item___"]')].filter(r=>visible(r)&&r.querySelector('div.amount-main-wrap, div[class*="amount___"]')&&itemIdFrom(r));}
 function addControls(row){
@@ -272,7 +284,7 @@ function maxQty(c){
 }
 async function fillAddPage(ctx){
   const rows=getAddRows().map(addControls).filter(Boolean);if(!rows.length)return null;
-  let filled=0,cityBetter=0,nikehSkipped=0,skipped=0,rwSkipped=0,dollarSkipped=0,itemMarketFallback=0,marketValueFallback=0;
+  let filled=0,cityBetter=0,nikehSkipped=0,skipped=0,rwSkipped=0,dollarSkipped=0,itemMarketFallback=0,marketValueFallback=0,marketCapped=0;
   for(let i=0;i<rows.length;i++){
     if(isRankedWarRow(rows[i].row)){rwSkipped++;continue;}
     if(rows[i].priceInputs.some(x=>parseMoneyValue(x)===1)){dollarSkipped++;continue;}
@@ -283,6 +295,7 @@ async function fillAddPage(ctx){
       const safe=await getSafePrice(rows[i].itemId,ctx);
       if(safe.source==='itemmarket')itemMarketFallback++;
       if(safe.source==='marketvalue')marketValueFallback++;
+      if(safe.marketCapApplied)marketCapped++;
       const city=getCitySell(ctx.items,rows[i].itemId);
       if(city>safe.listPrice){cityBetter++;continue;}
       if(rows[i].checkbox&&!rows[i].checkbox.checked)rows[i].checkbox.click();else if(rows[i].qty)setControlledInput(rows[i].qty,q);
@@ -290,7 +303,7 @@ async function fillAddPage(ctx){
     }catch(e){skipped++;console.warn(`[${SCRIPT}] add ${rows[i].itemId}`,e);}
     await sleep(100);
   }
-  return {mode:'add',filled,cityBetter,nikehSkipped,skipped,rwSkipped,dollarSkipped,itemMarketFallback,marketValueFallback,total:rows.length};
+  return {mode:'add',filled,cityBetter,nikehSkipped,skipped,rwSkipped,dollarSkipped,itemMarketFallback,marketValueFallback,marketCapped,total:rows.length};
 }
 function setButtonState(text,disabled=false){const b=document.getElementById('cbf-fill-page');if(!b)return;b.textContent=text;b.disabled=disabled;b.style.opacity=disabled?'.7':'1';}
 function toast(msg,type='ok'){
@@ -307,6 +320,7 @@ async function fillPage(){
     if(result.mode==='manage'){
       const bits=[`${result.repriced} repriced`,`${result.removed} marked for removal`];
       if(result.nikehRemoved)bits.push(`${result.nikehRemoved} Nikeh`);
+      if(result.marketCapped)bits.push(`${result.marketCapped} market-capped`);
       if(result.itemMarketFallback)bits.push(`${result.itemMarketFallback} IM fallback`);
       if(result.marketValueFallback)bits.push(`${result.marketValueFallback} market-value fallback`);
       if(result.rwSkipped)bits.push(`${result.rwSkipped} RW skipped`);
@@ -317,6 +331,7 @@ async function fillPage(){
       const bits=[`${result.filled} filled`];
       if(result.nikehSkipped)bits.push(`${result.nikehSkipped} Nikeh skipped`);
       if(result.cityBetter)bits.push(`${result.cityBetter} better sold to city`);
+      if(result.marketCapped)bits.push(`${result.marketCapped} market-capped`);
       if(result.itemMarketFallback)bits.push(`${result.itemMarketFallback} IM fallback`);
       if(result.marketValueFallback)bits.push(`${result.marketValueFallback} market-value fallback`);
       if(result.rwSkipped)bits.push(`${result.rwSkipped} RW skipped`);
@@ -335,6 +350,6 @@ function injectUI(){
   g.addEventListener('click',()=>{const v=prompt('Undercut the safe competing price by how many dollars?',String(getUndercut()));if(v===null)return;const n=Number(v.replace(/,/g,'').trim());if(!Number.isFinite(n)||n<0)return toast('Enter a valid non-negative dollar amount.','error');localStorage.setItem(UNDERCUT_STORAGE,String(Math.floor(n)));toast(`Undercut set to $${Math.floor(n).toLocaleString()}.`);});
   w.append(b,g);document.body.appendChild(w);
 }
-function boot(){injectUI();new MutationObserver(injectUI).observe(document.documentElement,{childList:true,subtree:true});console.log(`[${SCRIPT}] Loaded v0.8.0`);}
+function boot(){injectUI();new MutationObserver(injectUI).observe(document.documentElement,{childList:true,subtree:true});console.log(`[${SCRIPT}] Loaded v0.9.0`);}
 if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',boot,{once:true});else boot();
 })();
