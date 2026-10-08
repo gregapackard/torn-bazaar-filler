@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Cloudy's Bazaar Filler
 // @namespace    https://github.com/gregapackard/torn-bazaar-filler
-// @version      0.2.0
-// @description  PDA-first Torn bazaar filler/repricer. One button fills Add Items or reprices every rendered Manage Items row.
+// @version      0.3.0
+// @description  PDA-first Torn bazaar filler/repricer. One button fills Add Items or opens and reprices each visible Manage Items row on mobile.
 // @author       CloudyMuffin440 [4315564]
 // @license      MIT
 // @match        https://www.torn.com/bazaar.php*
@@ -57,53 +57,98 @@ async function getLowestMarketPrice(itemId,key){
   return prices[0];
 }
 function itemIdFrom(el){
-  const img=el?.querySelector('img[src*="items"], img'); if(!img)return null;
+  const img=el?.querySelector('img[src*="/items/"], img'); if(!img)return null;
   const src=img.src||img.getAttribute('src')||'';
-  const m=src.match(/(?:items|item)\/(\d+)(?:\/|\.|$)/i)||src.match(/\/(\d+)\.(?:png|jpg|webp)/i)||src.match(/\/(\d+)\//);
+  const m=src.match(/\/items\/(\d+)\//i)||src.match(/\/items\/(\d+)\./i)||src.match(/\/(\d+)\.(?:png|jpg|webp)/i)||src.match(/\/(\d+)\//);
   return m?Number(m[1]):null;
 }
 function itemName(el){
   const txt=(el?.innerText||'').split('\n').map(x=>x.trim()).filter(Boolean);
   return txt.find(x=>!/^x?\d+$/.test(x)&&!/^\$/.test(x))||'item';
 }
+async function waitFor(fn,timeout=1800,interval=40){
+  const end=Date.now()+timeout;
+  while(Date.now()<end){const v=fn();if(v)return v;await sleep(interval);}return null;
+}
 
-// ---------- Manage Items ----------
-function manageSection(){
-  const headings=[...document.querySelectorAll('div[role="heading"], h1,h2,h3,h4, div[class*="title"], div[class*="panelHeader"]')];
-  const h=headings.find(x=>/manage (your )?bazaar|manage items/i.test(x.textContent||''));
-  if(!h)return null;
-  let n=h.parentElement;
-  for(let i=0;i<6&&n&&n!==document.body;i++,n=n.parentElement){
-    if(n.querySelector('div[data-testid="sortable-item"], div[class*="item___"]'))return n;
+// ---------- Manage Items / PDA ----------
+function getManageRows(){
+  const descs=[...document.querySelectorAll(
+    'div[data-testid="sortable-item"] div[class*="item___"] div[class*="desc___"], '+
+    'div[class*="row___"] div[class*="item___"] div[class*="desc___"]'
+  )];
+  const out=[],seen=new Set();
+  for(const desc of descs){
+    const row=desc.closest('div[data-testid="sortable-item"], div[class*="row___"]')||desc.parentElement?.parentElement;
+    if(!row||!visible(row))continue;
+    const id=itemIdFrom(row);
+    if(!id||seen.has(id))continue;
+    seen.add(id);
+    out.push({row,desc,itemId:id,name:itemName(row)});
+  }
+  return out;
+}
+function getManageButton(row){
+  return row.querySelector('[class*="menuActivators___"] button[class*="iconContainer___"][aria-label="Manage"]')
+      || row.querySelector('button[aria-label="Manage"]')
+      || [...row.querySelectorAll('button')].find(b=>/manage/i.test(b.getAttribute('aria-label')||b.title||''));
+}
+function isManageButtonActive(button){
+  return !!button?.querySelector('span[class*="active___"]') || button?.getAttribute('aria-expanded')==='true';
+}
+function findMobilePriceInput(row){
+  const parent=row.parentElement;
+  const scopes=[parent,row,document];
+  for(const scope of scopes){
+    if(!scope)continue;
+    const box=scope.querySelector('[class*="bottomMobileMenu___"] [class*="priceMobile___"]');
+    if(box){
+      const input=box.querySelector('div.input-money-group input, input');
+      if(input&&visible(input))return input;
+    }
   }
   return null;
 }
-function getManageRows(){
-  const root=manageSection(); if(!root)return [];
-  let rows=[...root.querySelectorAll('div[data-testid="sortable-item"]')];
-  if(!rows.length)rows=[...root.querySelectorAll('div[class*="row___"] div[class*="item___"], div[class*="item___"]')];
-  const out=[],seen=new Set();
-  for(const row of rows){
-    if(!visible(row))continue;
-    const id=itemIdFrom(row); if(!id||seen.has(id))continue;
-    const p=row.querySelector('div[class*="price"] input.input-money, div[class*="price"] input, input.input-money');
-    if(!p)continue;
-    seen.add(id);out.push({row,itemId:id,priceInput:p,name:itemName(row)});
-  }
-  return out;
+async function openManageRow(entry){
+  let input=findMobilePriceInput(entry.row);
+  if(input)return {input,button:getManageButton(entry.row),openedByUs:false};
+
+  const button=getManageButton(entry.row);
+  if(!button)throw new Error('Manage button not found');
+  const wasActive=isManageButtonActive(button);
+  if(!wasActive)button.click();
+
+  input=await waitFor(()=>findMobilePriceInput(entry.row),2200,50);
+  if(!input)throw new Error('Mobile price panel did not open');
+  return {input,button,openedByUs:!wasActive};
+}
+async function closeManageRow(handle){
+  if(!handle?.openedByUs||!handle.button)return;
+  handle.button.click();
+  await sleep(90);
 }
 async function fillManagePage(key){
   const rows=getManageRows();
   if(!rows.length)return null;
   let filled=0,failed=0;
+
   for(let i=0;i<rows.length;i++){
-    setButtonState(`REPRICING ${i+1}/${rows.length}…`,true);
+    setButtonState(`OPENING ${i+1}/${rows.length}…`,true);
+    let handle=null;
     try{
+      handle=await openManageRow(rows[i]);
+      setButtonState(`PRICING ${i+1}/${rows.length}…`,true);
       const low=await getLowestMarketPrice(rows[i].itemId,key);
       const price=Math.max(1,low-getUndercut());
-      setControlledInput(rows[i].priceInput,price);
+      setControlledInput(handle.input,price);
+      await sleep(100);
       filled++;
-    }catch(e){failed++;console.warn(`[${SCRIPT}] ${rows[i].name} (${rows[i].itemId})`,e);}
+    }catch(e){
+      failed++;
+      console.warn(`[${SCRIPT}] ${rows[i].name} (${rows[i].itemId})`,e);
+    }finally{
+      await closeManageRow(handle);
+    }
     await sleep(90);
   }
   return {mode:'manage',filled,failed,total:rows.length};
@@ -147,7 +192,7 @@ async function fillAddPage(key){
 
 function setButtonState(text,disabled=false){const b=document.getElementById('cbf-fill-page');if(!b)return;b.textContent=text;b.disabled=disabled;b.style.opacity=disabled?'.7':'1';}
 function toast(msg,type='ok'){
-  let b=document.getElementById('cbf-toast');if(!b){b=document.createElement('div');b.id='cbf-toast';Object.assign(b.style,{position:'fixed',left:'12px',right:'12px',bottom:'76px',zIndex:'2147483647',padding:'11px 14px',borderRadius:'10px',fontSize:'13px',fontWeight:'700',textAlign:'center',color:'#fff',boxShadow:'0 4px 14px rgba(0,0,0,.35)',pointerEvents:'none'});document.body.appendChild(b);}b.style.background=type==='error'?'#a82c2c':type==='warn'?'#8a6515':'#287842';b.textContent=msg;b.style.opacity='1';clearTimeout(b._t);b._t=setTimeout(()=>b.style.opacity='0',4000);
+  let b=document.getElementById('cbf-toast');if(!b){b=document.createElement('div');b.id='cbf-toast';Object.assign(b.style,{position:'fixed',left:'12px',right:'12px',bottom:'76px',zIndex:'2147483647',padding:'11px 14px',borderRadius:'10px',fontSize:'13px',fontWeight:'700',textAlign:'center',color:'#fff',boxShadow:'0 4px 14px rgba(0,0,0,.35)',pointerEvents:'none'});document.body.appendChild(b);}b.style.background=type==='error'?'#a82c2c':type==='warn'?'#8a6515':'#287842';b.textContent=msg;b.style.opacity='1';clearTimeout(b._t);b._t=setTimeout(()=>b.style.opacity='0',4500);
 }
 async function fillPage(){
   if(busy)return;busy=true;setButtonState('SCANNING…',true);
@@ -168,6 +213,6 @@ function injectUI(){
   const g=document.createElement('button');g.type='button';g.textContent='⚙';Object.assign(g.style,{width:'52px',minHeight:'52px',border:'0',borderRadius:'12px',background:'#333',color:'#fff',fontSize:'22px',fontWeight:'700',boxShadow:'0 4px 16px rgba(0,0,0,.4)',touchAction:'manipulation'});g.addEventListener('click',()=>{const v=prompt('Undercut the cheapest Item Market listing by how many dollars?',String(getUndercut()));if(v===null)return;const n=Number(v.replace(/,/g,'').trim());if(!Number.isFinite(n)||n<0)return toast('Enter a valid non-negative dollar amount.','error');localStorage.setItem(UNDERCUT_STORAGE,String(Math.floor(n)));toast(`Undercut set to $${Math.floor(n).toLocaleString()}.`);});
   w.append(b,g);document.body.appendChild(w);
 }
-function boot(){injectUI();new MutationObserver(injectUI).observe(document.documentElement,{childList:true,subtree:true});console.log(`[${SCRIPT}] Loaded v0.2.0`);}
+function boot(){injectUI();new MutationObserver(injectUI).observe(document.documentElement,{childList:true,subtree:true});console.log(`[${SCRIPT}] Loaded v0.3.0`);}
 if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',boot,{once:true});else boot();
 })();
