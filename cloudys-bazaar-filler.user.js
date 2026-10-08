@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Cloudy's Bazaar Filler
 // @namespace    https://github.com/gregapackard/torn-bazaar-filler
-// @version      0.6.0
-// @description  PDA-first Torn bazaar repricer using Weav3r bazaars with safe Item Market fallback, lowball/$1 protection, RW skipping, and city-sell removal checks.
+// @version      0.7.0
+// @description  PDA-first Torn bazaar repricer using Weav3r with strict price clamps, safe Item Market fallback, RW/$1 protection, city-sell checks, and Nikeh removal.
 // @author       CloudyMuffin440 [4315564]
 // @license      MIT
 // @match        https://www.torn.com/bazaar.php*
@@ -23,9 +23,17 @@ const API_KEY_STORAGE='cloudys-bazaar-filler-api-key';
 const UNDERCUT_STORAGE='cloudys-bazaar-filler-undercut';
 const DEFAULT_UNDERCUT=1;
 const WEAV3R_STALE_MS=30*60*1000;
-const AVG_FLOOR_RATIO=0.60;
-const MEDIAN_FLOOR_RATIO=0.70;
-const ITEMMARKET_VALUE_FLOOR_RATIO=0.80;
+
+// Nikeh Performance direct-buy items (Sports Administration unlock).
+const NIKEH_ITEMS=new Map([
+  [1484,{name:'Bear Gall',sell:35000}],
+  [1494,{name:'Pangolin Scales',sell:205000}],
+  [1485,{name:'Shark Fin',sell:66000}],
+  [1498,{name:'Tiger Bone Powder',sell:70000}],
+  [1493,{name:'Whale Meat',sell:40000}],
+  [1268,{name:'Vitamins',sell:50}]
+]);
+
 let busy=false;
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 
@@ -76,64 +84,78 @@ function median(values){
   const a=[...values].sort((x,y)=>x-y),m=Math.floor(a.length/2);
   return a.length%2?a[m]:(a[m-1]+a[m])/2;
 }
-function getItemInfo(items,itemId){
-  return items?.[itemId]||items?.[String(itemId)]||null;
+function getItemInfo(items,id){return items?.[id]||items?.[String(id)]||null;}
+function getCitySell(items,id){const n=Number(getItemInfo(items,id)?.sell_price);return Number.isFinite(n)&&n>0?n:0;}
+function getMarketValue(items,id){const n=Number(getItemInfo(items,id)?.market_value);return Number.isFinite(n)&&n>1?n:0;}
+function clampPrice(value,min,max){
+  let n=Number(value);
+  if(Number.isFinite(min)&&min>0)n=Math.max(n,min);
+  if(Number.isFinite(max)&&max>0)n=Math.min(n,max);
+  return Math.max(2,Math.floor(n));
 }
-function getCitySell(items,itemId){
-  const n=Number(getItemInfo(items,itemId)?.sell_price);
-  return Number.isFinite(n)&&n>0?n:0;
-}
-function getMarketValue(items,itemId){
-  const n=Number(getItemInfo(items,itemId)?.market_value);
-  return Number.isFinite(n)&&n>1?n:0;
-}
-function analyseWeav3rListings(data,playerId){
-  const all=Array.isArray(data?.listings)?data.listings:[];
-  let usable=all.filter(x=>{
+
+// ---------- Pricing ----------
+function analyseWeav3r(data,playerId){
+  let listings=Array.isArray(data?.listings)?data.listings:[];
+  listings=listings.filter(x=>{
     const p=Number(x?.price);
     return Number.isFinite(p)&&p>1&&x?.sponsored!==1;
   });
-  if(playerId)usable=usable.filter(x=>Number(x?.player_id)!==playerId);
-  const fresh=usable.filter(x=>!x?.last_checked||Date.now()-(Number(x.last_checked)*1000)<=WEAV3R_STALE_MS);
-  if(fresh.length)usable=fresh;
-  usable.sort((a,b)=>Number(a.price)-Number(b.price));
-  const prices=usable.map(x=>Number(x.price));
+  if(playerId)listings=listings.filter(x=>Number(x?.player_id)!==playerId);
+  const fresh=listings.filter(x=>!x?.last_checked||Date.now()-(Number(x.last_checked)*1000)<=WEAV3R_STALE_MS);
+  if(fresh.length)listings=fresh;
+  listings.sort((a,b)=>Number(a.price)-Number(b.price));
+
+  const prices=listings.map(x=>Number(x.price));
   const avg=Number(data?.bazaar_average)||0;
   const med=median(prices);
-  const floor=Math.max(avg>0?avg*AVG_FLOOR_RATIO:0,med>0?med*MEDIAN_FLOOR_RATIO:0);
-  const sane=usable.filter(x=>Number(x.price)>=floor);
-  if(!sane.length)return {all:usable,sane:[],avg,median:med,floor,targetBase:0};
-  const targetIndex=sane.length>=3?2:0;
-  return {all:usable,sane,avg,median:med,floor,targetBase:Number(sane[targetIndex].price)};
+
+  // Toss obvious lowballs. A listing must be reasonably close to either normal anchor.
+  const floor=Math.max(avg?avg*0.70:0,med?med*0.80:0);
+  const sane=listings.filter(x=>Number(x.price)>=floor);
+  if(!sane.length)return null;
+
+  // Never use the old sparse-market third listing behavior.
+  // 1-4 sane listings: lowest sane. 5+: second-lowest sane.
+  let base=Number(sane[sane.length>=5?1:0].price);
+
+  // Hard ceiling: no current bazaar target can exceed normal anchors by >10%.
+  const ceilings=[];
+  if(avg>0)ceilings.push(avg*1.10);
+  if(med>0)ceilings.push(med*1.10);
+  const ceiling=ceilings.length?Math.min(...ceilings):0;
+  if(ceiling>0)base=Math.min(base,ceiling);
+
+  return {base,avg,median:med,floor,ceiling,sane};
 }
-async function getWeav3rPrice(itemId,playerId){
+async function getWeav3rPrice(itemId,ctx){
   const d=await requestJson(`https://weav3r.dev/api/marketplace/${encodeURIComponent(itemId)}`);
-  const a=analyseWeav3rListings(d,playerId);
-  if(!a.sane.length||!a.targetBase)throw new Error(`No sane competitor bazaar listings for item ${itemId}.`);
+  const a=analyseWeav3r(d,ctx.playerId);
+  if(!a||!a.base)throw new Error('No sane Weaver bazaar baseline');
   return {
     source:'weav3r',
-    listPrice:Math.max(2,a.targetBase-getUndercut()),
-    targetBase:a.targetBase,
-    average:a.avg,
-    median:a.median,
-    floor:a.floor,
-    listings:a.sane
+    targetBase:a.base,
+    listPrice:Math.max(2,Math.floor(a.base-getUndercut())),
+    average:a.avg,median:a.median,floor:a.floor,ceiling:a.ceiling
   };
 }
-function analyseItemMarketListings(listings,marketValue){
+function analyseItemMarket(listings,marketValue){
   const prices=(Array.isArray(listings)?listings:[])
-    .map(x=>Number(x?.price))
-    .filter(p=>Number.isFinite(p)&&p>1)
-    .sort((a,b)=>a-b);
+    .map(x=>Number(x?.price)).filter(p=>Number.isFinite(p)&&p>1).sort((a,b)=>a-b);
   const med=median(prices);
-  const floor=Math.max(
-    marketValue>0?marketValue*ITEMMARKET_VALUE_FLOOR_RATIO:0,
-    med>0?med*MEDIAN_FLOOR_RATIO:0
-  );
+  if(!prices.length)return {base:marketValue||0,median:med,sane:[]};
+
+  const floor=Math.max(marketValue?marketValue*0.85:0,med?med*0.80:0);
   const sane=prices.filter(p=>p>=floor);
-  if(!sane.length)return {prices,sane:[],median:med,floor,targetBase:0};
-  const targetIndex=sane.length>=3?2:0;
-  return {prices,sane,median:med,floor,targetBase:sane[targetIndex]};
+  if(!sane.length)return {base:marketValue||0,median:med,sane:[]};
+
+  // Sparse IM data uses the LOWEST sane entry, not the third listing.
+  let base=sane[sane.length>=5?1:0];
+
+  // market_value is the long-run anchor. Never let fallback exceed it by >10%.
+  const ceiling=marketValue>0?marketValue*1.10:(med>0?med*1.05:0);
+  if(ceiling>0)base=Math.min(base,ceiling);
+  return {base,median:med,sane,floor,ceiling};
 }
 async function getItemMarketFallback(itemId,ctx){
   const marketValue=getMarketValue(ctx.items,itemId);
@@ -142,31 +164,25 @@ async function getItemMarketFallback(itemId,ctx){
     const d=await requestJson(`https://api.torn.com/v2/market/${encodeURIComponent(itemId)}/itemmarket?key=${encodeURIComponent(ctx.key)}&limit=100&offset=0`);
     const root=d?.itemmarket||d?.itemMarket||d?.item_market||d;
     listings=Array.isArray(root)?root:(root?.listings||root?.items||root?.results||[]);
-  }catch(e){
-    console.warn(`[${SCRIPT}] Item Market fallback request failed for ${itemId}`,e);
-  }
-  const a=analyseItemMarketListings(listings,marketValue);
-  let targetBase=a.targetBase;
-  if(!targetBase&&marketValue>1)targetBase=marketValue;
-  if(!targetBase)throw new Error(`No safe market fallback for item ${itemId}.`);
+  }catch(e){console.warn(`[${SCRIPT}] IM request failed ${itemId}`,e);}
+  const a=analyseItemMarket(listings,marketValue);
+  if(!a.base)throw new Error('No safe market fallback');
   return {
     source:'itemmarket',
-    listPrice:Math.max(2,Math.floor(targetBase-getUndercut())),
-    targetBase,
-    marketValue,
-    median:a.median,
-    floor:a.floor,
-    listings:a.sane
+    targetBase:a.base,
+    listPrice:Math.max(2,Math.floor(a.base-getUndercut())),
+    marketValue,median:a.median,floor:a.floor||0,ceiling:a.ceiling||0
   };
 }
 async function getSafePrice(itemId,ctx){
-  try{
-    return await getWeav3rPrice(itemId,ctx.playerId);
-  }catch(e){
-    console.info(`[${SCRIPT}] Weav3r unavailable/unsafe for ${itemId}; using Item Market fallback.`,e?.message||e);
+  try{return await getWeav3rPrice(itemId,ctx);}
+  catch(e){
+    console.info(`[${SCRIPT}] Weaver unavailable/unsafe for ${itemId}; falling back to Item Market.`,e?.message||e);
     return getItemMarketFallback(itemId,ctx);
   }
 }
+
+// ---------- DOM helpers ----------
 function itemIdFrom(el){
   const img=el?.querySelector('img[src*="/items/"], img');if(!img)return null;
   const src=img.src||img.getAttribute('src')||'';
@@ -185,8 +201,7 @@ function isRankedWarRow(row){
   return !!bonus||!!(glow&&bonusWrap);
 }
 function parseMoneyValue(input){
-  const raw=String(input?.value??'').replace(/[$,\s]/g,'');
-  const n=Number(raw);
+  const n=Number(String(input?.value??'').replace(/[$,\s]/g,''));
   return Number.isFinite(n)?n:0;
 }
 async function waitFor(fn,timeout=2200,interval=40){
@@ -216,8 +231,7 @@ function getManageButton(row){
 }
 function isManageButtonActive(button){return !!button?.querySelector('span[class*="active___"]')||button?.getAttribute('aria-expanded')==='true';}
 function findMobileMenu(row){
-  const parent=row.parentElement;
-  for(const scope of [parent,row,document]){
+  for(const scope of [row.parentElement,row,document]){
     const menu=scope?.querySelector('[class*="bottomMobileMenu___"]');
     if(menu&&visible(menu))return menu;
   }
@@ -231,74 +245,74 @@ function findMobilePriceInput(row){
 }
 function findRemoveInput(row){
   const menu=findMobileMenu(row);
-  const scopes=[menu,row,row.parentElement].filter(Boolean);
-  for(const scope of scopes){
+  for(const scope of [menu,row,row.parentElement].filter(Boolean)){
     const input=scope.querySelector('[class*="remove___"] input, [class*="removeMobile___"] input, input[name*="remove" i]');
     if(input)return input;
   }
   return null;
 }
-function parseListedQty(row,removeInput){
-  const max=Number(removeInput?.max);if(Number.isFinite(max)&&max>0)return Math.floor(max);
-  const text=row?.innerText||'';
-  const hit=text.match(/x\s*([\d,]+)/i)||text.match(/(?:quantity|qty|listed)\D{0,12}([\d,]+)/i);
+function parseListedQty(row,input){
+  const max=Number(input?.max);if(Number.isFinite(max)&&max>0)return Math.floor(max);
+  const hit=(row?.innerText||'').match(/x\s*([\d,]+)/i)|| (row?.innerText||'').match(/(?:quantity|qty|listed)\D{0,12}([\d,]+)/i);
   return hit?Number(hit[1].replace(/,/g,'')):1;
 }
 async function openManageRow(entry){
   let input=findMobilePriceInput(entry.row);
   if(input)return {input,button:getManageButton(entry.row),openedByUs:false};
   const button=getManageButton(entry.row);if(!button)throw new Error('Manage button not found');
-  const wasActive=isManageButtonActive(button);if(!wasActive)button.click();
+  const active=isManageButtonActive(button);if(!active)button.click();
   input=await waitFor(()=>findMobilePriceInput(entry.row));
   if(!input)throw new Error('Mobile price panel did not open');
-  return {input,button,openedByUs:!wasActive};
+  return {input,button,openedByUs:!active};
 }
 async function closeManageRow(handle){if(handle?.openedByUs&&handle.button){handle.button.click();await sleep(100);}}
 async function markForRemoval(entry){
-  const removeInput=await waitFor(()=>findRemoveInput(entry.row),1000,40);
-  if(!removeInput)throw new Error('Remove quantity input not found');
-  const qty=parseListedQty(entry.row,removeInput);
-  setControlledInput(removeInput,qty);
+  const input=await waitFor(()=>findRemoveInput(entry.row),1000,40);
+  if(!input)throw new Error('Remove quantity input not found');
+  const qty=parseListedQty(entry.row,input);
+  setControlledInput(input,qty);
   return qty;
 }
 async function fillManagePage(ctx){
   const rows=getManageRows();if(!rows.length)return null;
-  let repriced=0,removed=0,failed=0,skipped=0,rwSkipped=0,dollarSkipped=0,itemMarketFallback=0;
+  let repriced=0,removed=0,nikehRemoved=0,failed=0,skipped=0,rwSkipped=0,dollarSkipped=0,itemMarketFallback=0;
+
   for(let i=0;i<rows.length;i++){
-    if(isRankedWarRow(rows[i].row)){
-      rwSkipped++;
-      console.info(`[${SCRIPT}] SKIP RW ${rows[i].name}`);
-      continue;
-    }
+    if(isRankedWarRow(rows[i].row)){rwSkipped++;continue;}
     setButtonState(`OPENING ${i+1}/${rows.length}…`,true);
     let handle=null;
     try{
       handle=await openManageRow(rows[i]);
       const currentPrice=parseMoneyValue(handle.input);
-      if(currentPrice===1){
-        dollarSkipped++;
-        console.info(`[${SCRIPT}] SKIP $1 ${rows[i].name}`);
+      if(currentPrice===1){dollarSkipped++;continue;}
+
+      // User has Nikeh Performance unlocked: always pull these back to inventory.
+      if(NIKEH_ITEMS.has(rows[i].itemId)){
+        await markForRemoval(rows[i]);
+        nikehRemoved++;removed++;
+        console.info(`[${SCRIPT}] NIKEH REMOVE ${rows[i].name}`);
         continue;
       }
+
       setButtonState(`CHECKING ${i+1}/${rows.length}…`,true);
       const safe=await getSafePrice(rows[i].itemId,ctx);
       if(safe.source==='itemmarket')itemMarketFallback++;
       const city=getCitySell(ctx.items,rows[i].itemId);
+
       if(city>safe.listPrice){
         await markForRemoval(rows[i]);removed++;
-        console.info(`[${SCRIPT}] REMOVE ${rows[i].name}: city $${city} > ${safe.source} $${safe.listPrice}`);
+        console.info(`[${SCRIPT}] REMOVE ${rows[i].name}: city ${city} > ${safe.source} ${safe.listPrice}`);
       }else{
         setControlledInput(handle.input,safe.listPrice);repriced++;
-        console.info(`[${SCRIPT}] PRICE ${rows[i].name}: $${safe.listPrice} via ${safe.source} | base $${Math.round(safe.targetBase)}`);
+        console.info(`[${SCRIPT}] PRICE ${rows[i].name}: ${safe.listPrice} via ${safe.source}; base ${Math.round(safe.targetBase)} ceiling ${Math.round(safe.ceiling||0)}`);
       }
-      await sleep(100);
     }catch(e){
       if(/No safe market fallback/.test(String(e?.message||'')))skipped++;else failed++;
       console.warn(`[${SCRIPT}] ${rows[i].name} (${rows[i].itemId})`,e);
     }finally{await closeManageRow(handle);}
     await sleep(100);
   }
-  return {mode:'manage',repriced,removed,failed,skipped,rwSkipped,dollarSkipped,itemMarketFallback,total:rows.length};
+  return {mode:'manage',repriced,removed,nikehRemoved,failed,skipped,rwSkipped,dollarSkipped,itemMarketFallback,total:rows.length};
 }
 
 // ---------- Add Items ----------
@@ -325,10 +339,11 @@ function maxQty(c){
 }
 async function fillAddPage(ctx){
   const rows=getAddRows().map(addControls).filter(Boolean);if(!rows.length)return null;
-  let filled=0,cityBetter=0,skipped=0,failed=0,rwSkipped=0,dollarSkipped=0,itemMarketFallback=0;
+  let filled=0,cityBetter=0,nikehSkipped=0,skipped=0,failed=0,rwSkipped=0,dollarSkipped=0,itemMarketFallback=0;
   for(let i=0;i<rows.length;i++){
     if(isRankedWarRow(rows[i].row)){rwSkipped++;continue;}
     if(rows[i].priceInputs.some(x=>parseMoneyValue(x)===1)){dollarSkipped++;continue;}
+    if(NIKEH_ITEMS.has(rows[i].itemId)){nikehSkipped++;continue;}
     setButtonState(`FILLING ${i+1}/${rows.length}…`,true);
     try{
       const q=maxQty(rows[i]);if(!q){skipped++;continue;}
@@ -340,11 +355,11 @@ async function fillAddPage(ctx){
       rows[i].priceInputs.forEach(x=>setControlledInput(x,safe.listPrice));filled++;
     }catch(e){
       if(/No safe market fallback/.test(String(e?.message||'')))skipped++;else failed++;
-      console.warn(`[${SCRIPT}] add item ${rows[i].itemId}`,e);
+      console.warn(`[${SCRIPT}] add ${rows[i].itemId}`,e);
     }
     await sleep(100);
   }
-  return {mode:'add',filled,cityBetter,skipped,failed,rwSkipped,dollarSkipped,itemMarketFallback,total:rows.length};
+  return {mode:'add',filled,cityBetter,nikehSkipped,skipped,failed,rwSkipped,dollarSkipped,itemMarketFallback,total:rows.length};
 }
 
 function setButtonState(text,disabled=false){
@@ -359,19 +374,20 @@ function toast(msg,type='ok'){
     document.body.appendChild(b);
   }
   b.style.background=type==='error'?'#a82c2c':type==='warn'?'#8a6515':'#287842';
-  b.textContent=msg;b.style.opacity='1';clearTimeout(b._t);b._t=setTimeout(()=>b.style.opacity='0',7000);
+  b.textContent=msg;b.style.opacity='1';clearTimeout(b._t);b._t=setTimeout(()=>b.style.opacity='0',8000);
 }
 async function fillPage(){
   if(busy)return;busy=true;setButtonState('LOADING PRICES…',true);
   try{
-    const key=getApiKey();
-    const ctx=await loadRunContext(key);
+    const ctx=await loadRunContext(getApiKey());
     let result=await fillManagePage(ctx);
     if(!result)result=await fillAddPage(ctx);
     if(!result){toast('No editable Bazaar rows found on this screen.','warn');return;}
+
     if(result.mode==='manage'){
       const bits=[`${result.repriced} repriced`,`${result.removed} marked for removal`];
-      if(result.itemMarketFallback)bits.push(`${result.itemMarketFallback} Item Market fallback`);
+      if(result.nikehRemoved)bits.push(`${result.nikehRemoved} Nikeh`);
+      if(result.itemMarketFallback)bits.push(`${result.itemMarketFallback} IM fallback`);
       if(result.rwSkipped)bits.push(`${result.rwSkipped} RW skipped`);
       if(result.dollarSkipped)bits.push(`${result.dollarSkipped} $1 skipped`);
       if(result.skipped)bits.push(`${result.skipped} no safe price`);
@@ -379,8 +395,9 @@ async function fillPage(){
       toast(`${bits.join(' • ')}. Review, then tap SAVE CHANGES.`,result.failed?'warn':'ok');
     }else{
       const bits=[`${result.filled} filled`];
-      if(result.itemMarketFallback)bits.push(`${result.itemMarketFallback} Item Market fallback`);
+      if(result.nikehSkipped)bits.push(`${result.nikehSkipped} Nikeh skipped`);
       if(result.cityBetter)bits.push(`${result.cityBetter} better sold to city`);
+      if(result.itemMarketFallback)bits.push(`${result.itemMarketFallback} IM fallback`);
       if(result.rwSkipped)bits.push(`${result.rwSkipped} RW skipped`);
       if(result.dollarSkipped)bits.push(`${result.dollarSkipped} $1 skipped`);
       if(result.skipped)bits.push(`${result.skipped} no safe price`);
@@ -400,7 +417,7 @@ function injectUI(){
   const g=document.createElement('button');g.type='button';g.textContent='⚙';
   Object.assign(g.style,{width:'52px',minHeight:'52px',border:'0',borderRadius:'12px',background:'#333',color:'#fff',fontSize:'22px',fontWeight:'700',boxShadow:'0 4px 16px rgba(0,0,0,.4)',touchAction:'manipulation'});
   g.addEventListener('click',()=>{
-    const v=prompt('Undercut the safe target by how many dollars?',String(getUndercut()));if(v===null)return;
+    const v=prompt('Undercut the safe bazaar/market target by how many dollars?',String(getUndercut()));if(v===null)return;
     const n=Number(v.replace(/,/g,'').trim());if(!Number.isFinite(n)||n<0)return toast('Enter a valid non-negative dollar amount.','error');
     localStorage.setItem(UNDERCUT_STORAGE,String(Math.floor(n)));toast(`Undercut set to $${Math.floor(n).toLocaleString()}.`);
   });
@@ -408,7 +425,7 @@ function injectUI(){
 }
 function boot(){
   injectUI();new MutationObserver(injectUI).observe(document.documentElement,{childList:true,subtree:true});
-  console.log(`[${SCRIPT}] Loaded v0.6.0`);
+  console.log(`[${SCRIPT}] Loaded v0.7.0`);
 }
 if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',boot,{once:true});else boot();
 })();
