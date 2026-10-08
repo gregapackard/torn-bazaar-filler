@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Cloudy's Bazaar Filler
 // @namespace    https://github.com/gregapackard/torn-bazaar-filler
-// @version      0.1.0
-// @description  PDA-first Torn bazaar filler: one button fills every visible Add Items row with max quantity and lowest Item Market price minus $1.
+// @version      0.2.0
+// @description  PDA-first Torn bazaar filler/repricer. One button fills Add Items or reprices every rendered Manage Items row.
 // @author       CloudyMuffin440 [4315564]
 // @license      MIT
 // @match        https://www.torn.com/bazaar.php*
@@ -15,292 +15,159 @@
 // ==/UserScript==
 
 (() => {
-    'use strict';
+'use strict';
 
-    const SCRIPT = 'CloudyBazaarFiller';
-    const API_KEY_STORAGE = 'cloudys-bazaar-filler-api-key';
-    const UNDERCUT_STORAGE = 'cloudys-bazaar-filler-undercut';
-    const DEFAULT_UNDERCUT = 1;
+const SCRIPT='CloudyBazaarFiller';
+const API_KEY_STORAGE='cloudys-bazaar-filler-api-key';
+const UNDERCUT_STORAGE='cloudys-bazaar-filler-undercut';
+const DEFAULT_UNDERCUT=1;
+let busy=false;
+const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 
-    let busy = false;
+function fireInput(input){
+  input.dispatchEvent(new Event('input',{bubbles:true}));
+  input.dispatchEvent(new Event('change',{bubbles:true}));
+  input.dispatchEvent(new KeyboardEvent('keyup',{bubbles:true,key:'0'}));
+}
+function setControlledInput(input,value){
+  if(!input)return;
+  const d=Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value');
+  if(d?.set)d.set.call(input,String(value)); else input.value=String(value);
+  fireInput(input);
+}
+function visible(el){
+  if(!el)return false;
+  const r=el.getBoundingClientRect(),s=getComputedStyle(el);
+  return r.width>0&&r.height>0&&s.display!=='none'&&s.visibility!=='hidden';
+}
+function getApiKey(){
+  let key=localStorage.getItem(API_KEY_STORAGE)||'';
+  if(/^[A-Za-z0-9]{16}$/.test(key))return key;
+  key=(prompt("Cloudy's Bazaar Filler\n\nEnter your 16-character Torn PUBLIC/LIMITED API key. It stays in this browser/PDA.")||'').trim();
+  if(!/^[A-Za-z0-9]{16}$/.test(key))throw new Error('A valid 16-character Torn API key is required.');
+  localStorage.setItem(API_KEY_STORAGE,key);return key;
+}
+function getUndercut(){const n=Number(localStorage.getItem(UNDERCUT_STORAGE));return Number.isFinite(n)&&n>=0?Math.floor(n):DEFAULT_UNDERCUT;}
+function apiGet(url){return new Promise((resolve,reject)=>GM_xmlhttpRequest({method:'GET',url,timeout:12000,onload:r=>{try{const d=JSON.parse(r.responseText);d?.error?reject(new Error(d.error.error||`Torn API error ${d.error.code}`)):resolve(d);}catch(e){reject(e)}},onerror:()=>reject(new Error('Network error contacting Torn API.')),ontimeout:()=>reject(new Error('Torn API request timed out.'))}));}
+async function getLowestMarketPrice(itemId,key){
+  const d=await apiGet(`https://api.torn.com/v2/market?id=${encodeURIComponent(itemId)}&selections=itemMarket&key=${encodeURIComponent(key)}&comment=CloudysBazaarFiller`);
+  const listings=d?.itemmarket||d?.itemMarket||d?.item_market||[];
+  const prices=Array.isArray(listings)?listings.map(x=>Number(x?.price)).filter(x=>Number.isFinite(x)&&x>0).sort((a,b)=>a-b):[];
+  if(!prices.length)throw new Error('No Item Market listings found.');
+  return prices[0];
+}
+function itemIdFrom(el){
+  const img=el?.querySelector('img[src*="items"], img'); if(!img)return null;
+  const src=img.src||img.getAttribute('src')||'';
+  const m=src.match(/(?:items|item)\/(\d+)(?:\/|\.|$)/i)||src.match(/\/(\d+)\.(?:png|jpg|webp)/i)||src.match(/\/(\d+)\//);
+  return m?Number(m[1]):null;
+}
+function itemName(el){
+  const txt=(el?.innerText||'').split('\n').map(x=>x.trim()).filter(Boolean);
+  return txt.find(x=>!/^x?\d+$/.test(x)&&!/^\$/.test(x))||'item';
+}
 
-    const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+// ---------- Manage Items ----------
+function manageSection(){
+  const headings=[...document.querySelectorAll('div[role="heading"], h1,h2,h3,h4, div[class*="title"], div[class*="panelHeader"]')];
+  const h=headings.find(x=>/manage (your )?bazaar|manage items/i.test(x.textContent||''));
+  if(!h)return null;
+  let n=h.parentElement;
+  for(let i=0;i<6&&n&&n!==document.body;i++,n=n.parentElement){
+    if(n.querySelector('div[data-testid="sortable-item"], div[class*="item___"]'))return n;
+  }
+  return null;
+}
+function getManageRows(){
+  const root=manageSection(); if(!root)return [];
+  let rows=[...root.querySelectorAll('div[data-testid="sortable-item"]')];
+  if(!rows.length)rows=[...root.querySelectorAll('div[class*="row___"] div[class*="item___"], div[class*="item___"]')];
+  const out=[],seen=new Set();
+  for(const row of rows){
+    if(!visible(row))continue;
+    const id=itemIdFrom(row); if(!id||seen.has(id))continue;
+    const p=row.querySelector('div[class*="price"] input.input-money, div[class*="price"] input, input.input-money');
+    if(!p)continue;
+    seen.add(id);out.push({row,itemId:id,priceInput:p,name:itemName(row)});
+  }
+  return out;
+}
+async function fillManagePage(key){
+  const rows=getManageRows();
+  if(!rows.length)return null;
+  let filled=0,failed=0;
+  for(let i=0;i<rows.length;i++){
+    setButtonState(`REPRICING ${i+1}/${rows.length}…`,true);
+    try{
+      const low=await getLowestMarketPrice(rows[i].itemId,key);
+      const price=Math.max(1,low-getUndercut());
+      setControlledInput(rows[i].priceInput,price);
+      filled++;
+    }catch(e){failed++;console.warn(`[${SCRIPT}] ${rows[i].name} (${rows[i].itemId})`,e);}
+    await sleep(90);
+  }
+  return {mode:'manage',filled,failed,total:rows.length};
+}
 
-    function log(...args) {
-        console.log(`[${SCRIPT}]`, ...args);
-    }
+// ---------- Add Items ----------
+function getAddRows(){return [...document.querySelectorAll('ul.items-cont li.clearfix, div[class*="itemsContainner___"] div[class*="item___"], div[class*="rowItems___"] div[class*="item___"]')].filter(r=>visible(r)&&r.querySelector('div.amount-main-wrap, div[class*="amount___"]')&&itemIdFrom(r));}
+function addControls(row){
+  const amount=row.querySelector('div.amount-main-wrap, div[class*="amount___"]');
+  const price=row.querySelector('div.price, div[class*="price___"]');
+  if(!amount||!price)return null;
+  const checkbox=amount.querySelector('input[type="checkbox"]');
+  const qty=checkbox?null:amount.querySelector('input');
+  const priceInputs=[...price.querySelectorAll('input')];
+  const id=itemIdFrom(row);
+  return id&&(checkbox||qty)&&priceInputs.length?{row,amount,checkbox,qty,priceInputs,itemId:id}:null;
+}
+function maxQty(c){
+  if(c.checkbox)return 1;
+  const m=Number(c.qty?.max);if(Number.isFinite(m)&&m>0)return Math.floor(m);
+  const text=c.row.innerText||'';
+  const hit=text.match(/x\s*([\d,]+)/i)||text.match(/(?:owned|available|max)\D{0,12}([\d,]+)/i);
+  return hit?Number(hit[1].replace(/,/g,'')):null;
+}
+async function fillAddPage(key){
+  const rows=getAddRows().map(addControls).filter(Boolean);
+  if(!rows.length)return null;
+  let filled=0,skipped=0,failed=0;
+  for(let i=0;i<rows.length;i++){
+    setButtonState(`FILLING ${i+1}/${rows.length}…`,true);
+    try{
+      const q=maxQty(rows[i]);if(!q){skipped++;continue;}
+      const low=await getLowestMarketPrice(rows[i].itemId,key),price=Math.max(1,low-getUndercut());
+      if(rows[i].checkbox&&!rows[i].checkbox.checked)rows[i].checkbox.click(); else if(rows[i].qty)setControlledInput(rows[i].qty,q);
+      rows[i].priceInputs.forEach(x=>setControlledInput(x,price));filled++;
+    }catch(e){failed++;console.warn(`[${SCRIPT}] add item ${rows[i].itemId}`,e);}
+    await sleep(90);
+  }
+  return {mode:'add',filled,skipped,failed,total:rows.length};
+}
 
-    function fireInput(input) {
-        input.dispatchEvent(new Event('input', { bubbles: true }));
-        input.dispatchEvent(new Event('change', { bubbles: true }));
-        input.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true, key: '0' }));
-    }
-
-    function setControlledInput(input, value) {
-        if (!input) return;
-        const proto = input instanceof HTMLInputElement ? HTMLInputElement.prototype : HTMLTextAreaElement.prototype;
-        const descriptor = Object.getOwnPropertyDescriptor(proto, 'value');
-        if (descriptor?.set) descriptor.set.call(input, String(value));
-        else input.value = String(value);
-        fireInput(input);
-    }
-
-    function getApiKey() {
-        let key = localStorage.getItem(API_KEY_STORAGE) || '';
-        if (/^[A-Za-z0-9]{16}$/.test(key)) return key;
-
-        key = (prompt("Cloudy's Bazaar Filler\n\nEnter your 16-character Torn PUBLIC/LIMITED API key. It is stored only in your browser/PDA local storage.") || '').trim();
-        if (!/^[A-Za-z0-9]{16}$/.test(key)) {
-            throw new Error('A valid 16-character Torn API key is required.');
-        }
-        localStorage.setItem(API_KEY_STORAGE, key);
-        return key;
-    }
-
-    function getUndercut() {
-        const raw = Number(localStorage.getItem(UNDERCUT_STORAGE));
-        return Number.isFinite(raw) && raw >= 0 ? Math.floor(raw) : DEFAULT_UNDERCUT;
-    }
-
-    function apiGet(url) {
-        return new Promise((resolve, reject) => {
-            GM_xmlhttpRequest({
-                method: 'GET',
-                url,
-                timeout: 12000,
-                onload: response => {
-                    try {
-                        const data = JSON.parse(response.responseText);
-                        if (data?.error) reject(new Error(data.error.error || `Torn API error ${data.error.code}`));
-                        else resolve(data);
-                    } catch (e) {
-                        reject(e);
-                    }
-                },
-                onerror: () => reject(new Error('Network error contacting Torn API.')),
-                ontimeout: () => reject(new Error('Torn API request timed out.'))
-            });
-        });
-    }
-
-    async function getLowestMarketPrice(itemId, apiKey) {
-        const url = `https://api.torn.com/v2/market?id=${encodeURIComponent(itemId)}&selections=itemMarket&key=${encodeURIComponent(apiKey)}&comment=CloudysBazaarFiller`;
-        const data = await apiGet(url);
-        const listings = data?.itemmarket || data?.itemMarket || data?.item_market || [];
-        if (!Array.isArray(listings) || !listings.length) throw new Error('No Item Market listings found.');
-
-        const prices = listings
-            .map(x => Number(x?.price))
-            .filter(x => Number.isFinite(x) && x > 0)
-            .sort((a, b) => a - b);
-
-        if (!prices.length) throw new Error('No valid Item Market prices found.');
-        return prices[0];
-    }
-
-    function getItemId(row) {
-        const img = row.querySelector('img[src*="/items/"]');
-        if (!img) return null;
-        const match = img.src.match(/\/items\/(\d+)\//) || img.src.match(/\/(\d+)\//);
-        return match ? Number(match[1]) : null;
-    }
-
-    function findAmountWrap(row) {
-        return row.querySelector('div.amount-main-wrap');
-    }
-
-    function getRowControls(row) {
-        const amountWrap = findAmountWrap(row);
-        if (!amountWrap) return null;
-
-        const checkbox = amountWrap.querySelector('div.amount.choice-container input[type="checkbox"], div.amount.choice-container input');
-        const quantityInput = checkbox ? null : amountWrap.querySelector('div.amount input');
-        const priceInputs = [...amountWrap.querySelectorAll('div.price input, div.input-money-group input')];
-        const itemId = getItemId(row);
-
-        if (!itemId || (!checkbox && !quantityInput) || !priceInputs.length) return null;
-        return { row, amountWrap, checkbox, quantityInput, priceInputs, itemId };
-    }
-
-    function getMaxQuantity(control) {
-        if (control.checkbox) return 1;
-        const input = control.quantityInput;
-        const maxAttr = Number(input?.max);
-        if (Number.isFinite(maxAttr) && maxAttr > 0) return Math.floor(maxAttr);
-
-        const amountText = control.amountWrap.textContent || '';
-        const patterns = [
-            /(?:owned|available|quantity|qty|max)\D{0,12}([\d,]+)/i,
-            /([\d,]+)\s*(?:available|owned)/i,
-            /x\s*([\d,]+)/i
-        ];
-        for (const pattern of patterns) {
-            const m = amountText.match(pattern);
-            if (m) {
-                const n = Number(m[1].replace(/,/g, ''));
-                if (Number.isFinite(n) && n > 0) return Math.floor(n);
-            }
-        }
-
-        // Torn's quantity input normally accepts its owned quantity via the browser max property.
-        // If DOM drift removes that hint, skip rather than risk listing the wrong amount.
-        return null;
-    }
-
-    function getVisibleAddRows() {
-        const candidates = [...document.querySelectorAll('li.clearfix')]
-            .filter(row => row.querySelector('div.amount-main-wrap') && row.querySelector('img[src*="/items/"]'));
-
-        return candidates.filter(row => {
-            const rect = row.getBoundingClientRect();
-            const style = getComputedStyle(row);
-            return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden';
-        });
-    }
-
-    function selectCheckbox(checkbox) {
-        if (checkbox && !checkbox.checked) checkbox.click();
-    }
-
-    async function fillRow(control, apiKey) {
-        const maxQty = getMaxQuantity(control);
-        if (!maxQty) return { status: 'skipped', itemId: control.itemId, reason: 'quantity' };
-
-        const lowest = await getLowestMarketPrice(control.itemId, apiKey);
-        const listPrice = Math.max(1, lowest - getUndercut());
-
-        if (control.checkbox) selectCheckbox(control.checkbox);
-        else setControlledInput(control.quantityInput, maxQty);
-
-        for (const priceInput of control.priceInputs) setControlledInput(priceInput, listPrice);
-
-        return { status: 'filled', itemId: control.itemId, qty: maxQty, lowest, listPrice };
-    }
-
-    function setButtonState(text, disabled = false) {
-        const btn = document.getElementById('cbf-fill-page');
-        if (!btn) return;
-        btn.textContent = text;
-        btn.disabled = disabled;
-        btn.style.opacity = disabled ? '0.7' : '1';
-    }
-
-    function toast(message, type = 'ok') {
-        let box = document.getElementById('cbf-toast');
-        if (!box) {
-            box = document.createElement('div');
-            box.id = 'cbf-toast';
-            Object.assign(box.style, {
-                position: 'fixed', left: '12px', right: '12px', bottom: '76px', zIndex: '2147483647',
-                padding: '11px 14px', borderRadius: '10px', fontSize: '13px', fontWeight: '700',
-                textAlign: 'center', color: '#fff', boxShadow: '0 4px 14px rgba(0,0,0,.35)',
-                pointerEvents: 'none', transition: 'opacity .2s ease'
-            });
-            document.body.appendChild(box);
-        }
-        box.style.background = type === 'error' ? '#a82c2c' : type === 'warn' ? '#8a6515' : '#287842';
-        box.textContent = message;
-        box.style.opacity = '1';
-        clearTimeout(box._cbfTimer);
-        box._cbfTimer = setTimeout(() => box.style.opacity = '0', 3500);
-    }
-
-    async function fillPage() {
-        if (busy) return;
-        busy = true;
-        setButtonState('FILLING…', true);
-
-        try {
-            const apiKey = getApiKey();
-            const rows = getVisibleAddRows();
-            const controls = rows.map(getRowControls).filter(Boolean);
-
-            if (!controls.length) {
-                toast('No Add Items rows found on this screen.', 'warn');
-                return;
-            }
-
-            let filled = 0;
-            let skipped = 0;
-            let failed = 0;
-
-            // Deliberately sequential. It is still one tap for the user, but keeps API usage smooth on PDA.
-            for (let i = 0; i < controls.length; i++) {
-                setButtonState(`FILLING ${i + 1}/${controls.length}…`, true);
-                try {
-                    const result = await fillRow(controls[i], apiKey);
-                    if (result.status === 'filled') filled++;
-                    else skipped++;
-                } catch (err) {
-                    failed++;
-                    log(`Item ${controls[i].itemId} failed:`, err);
-                }
-                await sleep(90);
-            }
-
-            toast(`${filled} filled${skipped ? ` • ${skipped} skipped` : ''}${failed ? ` • ${failed} failed` : ''}`, failed ? 'warn' : 'ok');
-        } catch (err) {
-            console.error(`[${SCRIPT}]`, err);
-            toast(err.message || 'Fill failed.', 'error');
-        } finally {
-            busy = false;
-            setButtonState('FILL THIS PAGE');
-        }
-    }
-
-    function injectUI() {
-        if (document.getElementById('cbf-fill-page')) return;
-
-        const wrap = document.createElement('div');
-        wrap.id = 'cbf-wrap';
-        Object.assign(wrap.style, {
-            position: 'fixed', left: '10px', right: '10px', bottom: '12px', zIndex: '2147483646',
-            display: 'flex', gap: '8px', alignItems: 'stretch', maxWidth: '680px', margin: '0 auto'
-        });
-
-        const btn = document.createElement('button');
-        btn.id = 'cbf-fill-page';
-        btn.type = 'button';
-        btn.textContent = 'FILL THIS PAGE';
-        Object.assign(btn.style, {
-            flex: '1 1 auto', minHeight: '52px', border: '0', borderRadius: '12px',
-            background: 'linear-gradient(180deg,#2f9b56,#247642)', color: '#fff', fontSize: '16px',
-            fontWeight: '900', letterSpacing: '.3px', boxShadow: '0 4px 16px rgba(0,0,0,.4)',
-            touchAction: 'manipulation', WebkitTapHighlightColor: 'transparent'
-        });
-        btn.addEventListener('click', fillPage);
-
-        const gear = document.createElement('button');
-        gear.type = 'button';
-        gear.textContent = '⚙';
-        gear.title = 'Cloudy Bazaar Filler settings';
-        Object.assign(gear.style, {
-            width: '52px', minHeight: '52px', border: '0', borderRadius: '12px', background: '#333',
-            color: '#fff', fontSize: '22px', fontWeight: '700', boxShadow: '0 4px 16px rgba(0,0,0,.4)',
-            touchAction: 'manipulation'
-        });
-        gear.addEventListener('click', () => {
-            const current = getUndercut();
-            const value = prompt('Undercut the cheapest Item Market listing by how many dollars?', String(current));
-            if (value === null) return;
-            const parsed = Number(value.replace(/,/g, '').trim());
-            if (!Number.isFinite(parsed) || parsed < 0) return toast('Enter a valid non-negative dollar amount.', 'error');
-            localStorage.setItem(UNDERCUT_STORAGE, String(Math.floor(parsed)));
-            toast(`Undercut set to $${Math.floor(parsed).toLocaleString()}.`);
-        });
-
-        wrap.append(btn, gear);
-        document.body.appendChild(wrap);
-    }
-
-    function boot() {
-        injectUI();
-        const observer = new MutationObserver(() => injectUI());
-        observer.observe(document.documentElement, { childList: true, subtree: true });
-        window.addEventListener('hashchange', injectUI);
-        log('Loaded v0.1.0');
-    }
-
-    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot, { once: true });
-    else boot();
+function setButtonState(text,disabled=false){const b=document.getElementById('cbf-fill-page');if(!b)return;b.textContent=text;b.disabled=disabled;b.style.opacity=disabled?'.7':'1';}
+function toast(msg,type='ok'){
+  let b=document.getElementById('cbf-toast');if(!b){b=document.createElement('div');b.id='cbf-toast';Object.assign(b.style,{position:'fixed',left:'12px',right:'12px',bottom:'76px',zIndex:'2147483647',padding:'11px 14px',borderRadius:'10px',fontSize:'13px',fontWeight:'700',textAlign:'center',color:'#fff',boxShadow:'0 4px 14px rgba(0,0,0,.35)',pointerEvents:'none'});document.body.appendChild(b);}b.style.background=type==='error'?'#a82c2c':type==='warn'?'#8a6515':'#287842';b.textContent=msg;b.style.opacity='1';clearTimeout(b._t);b._t=setTimeout(()=>b.style.opacity='0',4000);
+}
+async function fillPage(){
+  if(busy)return;busy=true;setButtonState('SCANNING…',true);
+  try{
+    const key=getApiKey();
+    let result=await fillManagePage(key);
+    if(!result)result=await fillAddPage(key);
+    if(!result){toast('No editable Bazaar rows found on this screen.','warn');return;}
+    if(result.mode==='manage')toast(`${result.filled}/${result.total} prices filled${result.failed?` • ${result.failed} failed`:''}. Review, then tap SAVE CHANGES.`,result.failed?'warn':'ok');
+    else toast(`${result.filled}/${result.total} filled${result.skipped?` • ${result.skipped} skipped`:''}${result.failed?` • ${result.failed} failed`:''}`,result.failed?'warn':'ok');
+  }catch(e){console.error(`[${SCRIPT}]`,e);toast(e.message||'Fill failed.','error');}
+  finally{busy=false;setButtonState('FILL THIS PAGE');}
+}
+function injectUI(){
+  if(document.getElementById('cbf-fill-page'))return;
+  const w=document.createElement('div');w.id='cbf-wrap';Object.assign(w.style,{position:'fixed',left:'10px',right:'10px',bottom:'12px',zIndex:'2147483646',display:'flex',gap:'8px',alignItems:'stretch',maxWidth:'680px',margin:'0 auto'});
+  const b=document.createElement('button');b.id='cbf-fill-page';b.type='button';b.textContent='FILL THIS PAGE';Object.assign(b.style,{flex:'1 1 auto',minHeight:'52px',border:'0',borderRadius:'12px',background:'linear-gradient(180deg,#2f9b56,#247642)',color:'#fff',fontSize:'16px',fontWeight:'900',letterSpacing:'.3px',boxShadow:'0 4px 16px rgba(0,0,0,.4)',touchAction:'manipulation'});b.addEventListener('click',fillPage);
+  const g=document.createElement('button');g.type='button';g.textContent='⚙';Object.assign(g.style,{width:'52px',minHeight:'52px',border:'0',borderRadius:'12px',background:'#333',color:'#fff',fontSize:'22px',fontWeight:'700',boxShadow:'0 4px 16px rgba(0,0,0,.4)',touchAction:'manipulation'});g.addEventListener('click',()=>{const v=prompt('Undercut the cheapest Item Market listing by how many dollars?',String(getUndercut()));if(v===null)return;const n=Number(v.replace(/,/g,'').trim());if(!Number.isFinite(n)||n<0)return toast('Enter a valid non-negative dollar amount.','error');localStorage.setItem(UNDERCUT_STORAGE,String(Math.floor(n)));toast(`Undercut set to $${Math.floor(n).toLocaleString()}.`);});
+  w.append(b,g);document.body.appendChild(w);
+}
+function boot(){injectUI();new MutationObserver(injectUI).observe(document.documentElement,{childList:true,subtree:true});console.log(`[${SCRIPT}] Loaded v0.2.0`);}
+if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',boot,{once:true});else boot();
 })();
